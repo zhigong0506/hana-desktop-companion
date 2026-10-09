@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Desktop observation companion">
+  <rect width="256" height="256" rx="48" fill="#2b2f3a"/>
+  <!-- window frame -->
+  <rect x="44" y="58" width="168" height="140" rx="14" fill="#f3f5fb" stroke="#c9cede" stroke-width="4"/>
+  <rect x="44" y="58" width="168" height="34" rx="14" fill="#8ea0c9"/>
+  <rect x="44" y="80" width="168" height="12" fill="#8ea0c9"/>
+  <circle cx="64" cy="75" r="6" fill="#ff6b6b"/>
+  <circle cx="82" cy="75" r="6" fill="#ffd166"/>
+  <circle cx="100" cy="75" r="6" fill="#06d6a0"/>
+  <!-- occluded window ghost behind, top-right -->
+  <rect x="150" y="34" width="86" height="70" rx="10" fill="none" stroke="#5b6478" stroke-width="3" stroke-dasharray="7 6"/>
+  <!-- crosshair targeting the window body -->
+  <g stroke="#ff8fab" stroke-width="7" stroke-linecap="round" fill="none">
+    <circle cx="128" cy="150" r="34"/>
+    <line x1="128" y1="100" x2="128" y2="122"/>
+    <line x1="128" y1="178" x2="128" y2="200"/>
+    <line x1="78"  y1="150" x2="100" y2="150"/>
+    <line x1="156" y1="150" x2="178" y2="150"/>
+  </g>
+  <circle cx="128" cy="150" r="8" fill="#ff8fab"/>
+</svg>

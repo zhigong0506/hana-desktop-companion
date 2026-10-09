@@ -1,0 +1,24 @@
+# Build artifacts
+native-src/bin/
+native-src/obj/
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Local scratch / capture output that must never be committed
+captures/
+_tmp/
+*.tmp
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# The app package's bundled native binaries ARE intentionally committed
+# (installable without a build step). Only dotnet's bin/obj intermediates are ignored.
+!app/hana-desktop-companion/native/*.dll
+!app/hana-desktop-companion/native/*.exe

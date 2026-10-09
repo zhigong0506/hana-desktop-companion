@@ -1,0 +1,40 @@
+{
+  "manifestVersion": 2,
+  "id": "hana-desktop-companion",
+  "name": "Hana 桌面观察补充",
+  "version": "0.1.1",
+  "description": "补充原生 computer：被遮挡窗口的定向截图、UIA 只读诊断，以及默认关闭、需宿主审阅的高级拖拽/滚轮/窗口管理。",
+  "author": { "name": "小檬 (Hana)" },
+  "license": "MIT",
+  "entry": "index.js",
+  "minAppVersion": "1.0.6-beta",
+  "icon": "assets/icon.svg",
+  "capabilities": [
+    "app/tools.expose-to-model",
+    "app/process.spawn",
+    "app/session.stage-file"
+  ],
+  "contributes": {
+    "settings": {
+      "title": "桌面观察补充",
+      "schema": {
+        "properties": {
+          "allowRealInput": {
+            "type": "boolean",
+            "title": "允许真实桌面输入",
+            "description": "默认关闭。关闭时拖拽/滚轮/窗口管理只返回预演计划，绝不移动系统指针或改动窗口。开启只是解除 App 内部这道闸；每次真实执行仍会走宿主的逐次审阅。",
+            "default": false
+          },
+          "actionPolicy": {
+            "type": "string",
+            "title": "允许的动作风险档",
+            "description": "在 allowRealInput 已开启的前提下，进一步限制哪一档风险的动作可被实际执行。close 与真实注入始终属 sensitive/destructive。",
+            "enum": ["destructive-only", "sensitive-and-destructive", "all-real-actions"],
+            "enumTitles": ["仅破坏性（需最高确认）", "敏感与破坏性", "全部真实动作"],
+            "default": "destructive-only"
+          }
+        }
+      }
+    }
+  }
+}
