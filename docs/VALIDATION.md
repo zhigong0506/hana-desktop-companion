@@ -234,3 +234,63 @@ The rebuilt helper was copied into `app/hana-desktop-companion/native/`;
 113664). `native-src/publish/` is an untracked local publish directory produced
 by the main agent; it was not modified or deleted and must not be committed.
 No signing was performed and no private key was read, used or stored.
+
+## 9. Clipboard write implementation — v0.2.1 (runtime checks passed)
+
+This change intentionally reverses the v0.2.0 decision that clipboard write was
+unsupported. The new `desktop_clipboard_write` is destructive, dry-run by
+default, target-bound (HWND+PID), and still subject to Hana's per-call review.
+It accepts only non-empty, non-credential text (maximum 8,192 UTF-16 code units
+and 64 KiB UTF-8); overflow is rejected rather than truncated.
+
+The payload is sent only through stdin to the fixed helper executable. It is not
+placed in argv, a shell command, a temporary file, helper stdout/stderr, or the
+write receipt. This does **not** keep the text out of Hana's tool-call/session
+records: the text is a tool argument, and the system clipboard is globally
+readable by applications in the same user session. Do not use this tool for
+passwords, tokens, or other credentials.
+
+### Completed code-level checks
+
+- `node --test "tests/*.test.mjs"`: 58 passed, 0 failed.
+- `dotnet publish native-src/HanaDesktopCompanion.Helper.csproj -c Release -r win-x64 --self-contained false`: passed; refreshed packaged helper binaries.
+- Official `validate-app.mjs` for both the App directory and the generated archive: `ok: true`, zero issues.
+- Candidate archive: `dist/app-hana-desktop-companion-0.2.1.zip` (2,512,071 bytes); entry metadata generated alongside it.
+- `git diff --check`: passed.
+
+### Code-level assertions
+
+- `clipboard-write` has no `text` flag; an unlisted flag cannot reach the helper.
+- Only the explicit `runHelperWithInput("clipboard-write", ...)` path accepts a
+  string payload; all other stdin-enabled verbs are rejected.
+- The helper enforces a byte limit while reading stdin, strict UTF-8 decoding,
+  non-empty text, secure-desktop refusal and fixed error codes.
+- The helper writes via `Clipboard.SetText` and returns only counts and the
+  clipboard sequence number; it never reads the value back for its receipt.
+- Pure-logic and source-parity tests cover these boundaries without touching the
+  real clipboard.
+
+### Runtime checks performed after installation
+
+- App capability receipt reported App/helper version `0.2.1`, x64, and the
+  clipboard read/write verbs; `allowRealInput` was on and `actionPolicy` was
+  `all-real-actions`. Every real tool call still passed the host review path.
+- Read the original plain-text clipboard value, wrote a unique Unicode test
+  string via the App, and read it back byte-for-byte/character-for-character;
+  the sequence number changed. Restored the original value and read it back to
+  confirm restoration. The original value is intentionally omitted here.
+- The tool schema refused an 8,193-character payload before invoking the App
+  handler, proving the public argument boundary. Separately invoked the native
+  helper with 8,193 characters, 65,537 bytes, invalid UTF-8, and empty stdin;
+  it returned the expected `payload-too-large`, `invalid-utf8`, and `text-empty`
+  refusals.
+  These helper failure paths do not call `Clipboard.SetText`.
+- Held the Windows clipboard open while invoking the native write helper. After
+  its bounded retry sequence it returned `clipboard-unavailable`; after closing
+  the lock, the original clipboard value was still present.
+- The real write receipt reported `changed: true`; the real Unicode readback
+  matched. No clipboard text was written to disk or included in this record.
+
+The Node-to-helper stdin route was also exercised by the successful real write
+and Unicode readback. Lock contention was tested with native `OpenClipboard`;
+no external process was introduced and the test caused no clipboard mutation.

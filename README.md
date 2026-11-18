@@ -15,7 +15,8 @@
 - **多显示器清单**：虚拟桌面总边界 + 每屏 bounds / workArea（物理像素）/ 是否主屏 / 有效 DPI 与缩放百分比。纯观察，用于多屏定位。
 - **有界 wait-for**：等待窗口出现/消失/可见/最小化/前台、标题包含、UIA 元素出现或消失、坐标命中目标窗口。最长 30s，到点返回 `timedOut`。它只返回观察结果，不执行动作、不自动继续计划。
 - **受限全局快捷键**：每次调用仅一个 chord（如 `ctrl+shift+s`），键位与修饰键都在闭合白名单内；含 Win 修饰键或系统级组合（Win+L、Alt+F4、Ctrl+Shift+Esc、Ctrl+Alt+Delete 等）一律拒绝，且执行前要求绑定窗口确实处于前台。
-- **剪贴板读取**：按 sensitive 处理，默认不读；严格截断。注意：读取到的文本会作为工具结果返回给调用方，因而进入宿主/模型上下文；本 App 只保证它不被写进日志或错误详情。**剪贴板写入未实现**：写入需要把明文放进 helper 的命令行，本机任何进程都能读到，因此不做，也不把它包装成“安全写入”。
+- **剪贴板读取**：按 sensitive 处理，默认不读；严格截断。读取正文会作为工具结果进入宿主/模型上下文。
+- **剪贴板写入**：按 destructive 处理，默认只预览；非空文本最多 8192 字符、UTF-8 64 KiB，超限拒绝不截断。正文经 helper stdin 传输，不进 argv 或临时文件，回执不回显正文；但工具参数仍可能被宿主记录。仅用于非凭据文本。与另一次单独审阅的 `Ctrl+V` 组合后，可以向前台应用粘贴工具提供的文本。
 - **受控高级动作**：拖拽、滚轮（UIA 无法表达的语义）与窗口管理（移动/缩放/最小化/最大化/还原/优雅关闭 `WM_CLOSE`）。**全部默认 dryRun**，须 `execute=true` 且通过多重闸门才实际注入。
 - **截图作为会话文件交付**：PNG 复制进会话登记为产物，供模型理解和用户留档。
 
@@ -46,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 
 输出 `ok=true` 且 `windows / x64Process / dotnet8WindowsDesktopRuntime / nativeHelperExists / nativeHelperSmokeTest` 全部为 `true` 即可安装。也可用 `dotnet --list-runtimes` 确认存在 `Microsoft.WindowsDesktop.App 8.0.x`。
 
-## 工具（13 个）
+## 工具（14 个）
 
 | 工具 | 风险档 | 默认行为 |
 |---|---|---|
@@ -60,15 +61,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 | `desktop_mouse_drag` / `desktop_mouse_wheel` | destructive | **默认 dryRun**；同上 |
 | `desktop_send_keys` | sensitive | **默认 dryRun**；须绑定前台 hwnd+expectedPid，键位先过筛查表 |
 | `desktop_clipboard_read` | sensitive | **默认 dryRun**；读取截断，回执只给长度与是否截断 |
+| `desktop_clipboard_write` | destructive | **默认 dryRun**；stdin 传文，拒绝超限，仅回写入回执 |
 
 ## 安全与隐私边界（多层防御，宿主逐次审阅始终是最外层）
 
 - 三个动作类工具不声明 `readOnly`、不声明 `auto:"allow"`——宿主对**每一次调用**走审阅。观察类工具（含 `desktop_wait_for`、`desktop_displays_list`、`desktop_capabilities`）显式声明只读。
 - App 自有开关 `allowRealInput` **默认关闭**：关闭时动作类工具只返回预演计划，绝不移动系统指针、注入按键或读写剪贴板。开启它只解除 App 内部这道闸，不能绕过宿主审阅。
-- `actionPolicy` 默认档 `destructive-only` **不放行 sensitive**，所以快捷键与剪贴板读取即使开了 `allowRealInput` 也需要显式选到 `sensitive-and-destructive`。
-- 键盘走固定键位白名单（字母/数字/F1-F12/导航键）与固定修饰键白名单（ctrl/alt/shift）。**任何带 Win 修饰键的组合整体拒绝**，另加系统级组合拒绝表（Win+L、Win+R、Alt+F4、Alt+Tab、Ctrl+Shift+Esc、Ctrl+Alt+Delete、Ctrl+Esc、Alt+Space 等）。每次调用严格限制为一个 chord。不做自由文本输入。
+- `actionPolicy` 默认档 `destructive-only` **不放行 sensitive**，所以快捷键与剪贴板读取即使开了 `allowRealInput` 也需要显式选到 `sensitive-and-destructive`；剪贴板写入属 destructive。
+- 键盘走固定键位白名单（字母/数字/F1-F12/导航键）与固定修饰键白名单（ctrl/alt/shift）。**任何带 Win 修饰键的组合整体拒绝**，另加系统级组合拒绝表（Win+L、Win+R、Alt+F4、Alt+Tab、Ctrl+Shift+Esc、Ctrl+Alt+Delete、Ctrl+Esc、Alt+Space 等）。每次调用严格限制为一个 chord；没有逐字符输入工具，剪贴板写入再配合单独审阅的 `Ctrl+V` 可粘贴工具提供的文本。
 - 快捷键执行前校验绑定窗口**确实是当前前台窗口**，并在注入前复核 PID；不满足则拒绝（`target-not-foreground` / `pid-changed`）。安全桌面（锁屏、UAC）下拒绝键盘与剪贴板操作。
-- 剪贴板：**只有读取**，按 sensitive、默认不读，长度上限 4000 字符（默认 2000）。回执只给字符数与是否截断；正文作为工具结果返回给调用方，**会进入宿主/模型上下文**——本 App 不把它写进日志或错误详情，但不宣称它不会出现在宿主的会话记录里。绑定的 HWND 只是审计锚点（剪贴板是进程全局的），不是投递目标。
+- 剪贴板读取：按 sensitive、默认不读，长度上限 4000 字符（默认 2000）；正文会进入宿主/模型上下文。写入按 destructive、默认 dryRun，非凭据文本最多 8192 字符 / 64 KiB；明文只经 stdin，不进 argv 或临时文件，但工具参数仍可能进入宿主会话记录。写入回执仅含长度与序号，不回显正文。绑定 HWND 是审计锚点，剪贴板仍为进程全局资源；写入后再调用 `Ctrl+V` 可构成经过两次审阅的文本粘贴流程。
 - 模型回填的确认串只是"知悉回执"，**不构成用户批准**。
 - 真实注入要求新鲜的 `hwnd` + `expectedPid` 绑定，并在注入前即时重跑 `WindowFromPoint`；焦点漂移、坐标不再命中目标窗口时拒绝（实测有效）。
 - `close` 强制显式 `hwnd`，拒绝标题/前台匹配；用 `WM_CLOSE` 优雅关闭，应用仍可弹未保存提示、用户可取消。
@@ -141,7 +143,7 @@ hana-desktop-companion/
 ├─ scripts/check-environment.ps1
 ├─ app/hana-desktop-companion/        # 可直接安装的 v2 App
 │  ├─ manifest.json                   # 能力与设置页 schema 声明
-│  ├─ index.js                        # 13 个工具注册 + 动作门流程
+│  ├─ index.js                        # 14 个工具注册 + 动作门流程
 │  ├─ lib/helper.js                   # 固定动词白名单的 helper 桥
 │  ├─ lib/gates.js                    # App 级真实输入门（默认关闭）
 │  ├─ lib/shortcuts.js                # 键位/组合键筛查表（纯逻辑，与 helper 镜像）
@@ -163,7 +165,7 @@ hana-desktop-companion/
 
 v0.1.1 在 Hana 1.0.6-beta / Windows x64 完成安装后端到端验收：观察、遮挡窗口截图（含缩放 GDI 修复回归）、UIA 诊断、默认安全门拦截、真实 `move`/`minimize`/`restore`/`close` 均有回读或截图硬证据；drag/wheel 的可见成功未单独取证（原因见上节）。官方 `validate/smoke/pack/archive` 全部 0 error 0 warning。详见 [docs/VALIDATION.md](docs/VALIDATION.md)。
 
-v0.2.0 新增的 verb / 工具以**纯逻辑测试 + 只读实测**验收：`list-displays`、`wait-for`、`capabilities` 已在真机跑通；`send-keys` 与 `clipboard-read` 只验证了默认阻断、参数校验、键位筛查与 dryRun 计划，**未做真实按键注入，也未真实读取剪贴板**。剪贴板写入未实现。详见 [docs/VALIDATION.md](docs/VALIDATION.md) §8。
+v0.2.0 新增能力以**纯逻辑测试 + 只读实测**验收；v0.2.1 已通过 58 项纯逻辑测试、helper 构建及官方静态目录/归档校验。重装后的 0.2.1 还完成了真实剪贴板 Unicode 写入/读回、恢复原值，以及 helper 对超限、无效 UTF-8、空输入和剪贴板占用的拒绝路径校验。非空剪贴板读取已用于本次 Unicode 往返与恢复核验；真实按键注入仍未完成端到端验收。详见 [docs/VALIDATION.md](docs/VALIDATION.md) §9。
 
 ## 来源与归因
 

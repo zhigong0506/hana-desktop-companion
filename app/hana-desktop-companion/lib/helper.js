@@ -9,7 +9,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -32,6 +32,7 @@ const VERB_FLAGS = {
   "wait-for": ["condition", "hwnd", "title", "foreground", "expectedPid", "query", "role", "x", "y", "timeoutMs", "intervalMs"],
   "send-keys": ["chord", "holdMs", "hwnd", "expectedPid", "execute"],
   "clipboard-read": ["hwnd", "expectedPid", "maxChars", "execute"],
+  "clipboard-write": ["hwnd", "expectedPid", "maxChars", "execute"],
   "capabilities": [],
 };
 
@@ -88,6 +89,62 @@ function timeoutFor(verb, opts) {
   if (verb !== "wait-for") return base;
   const requested = Number(opts?.timeoutMs);
   return Number.isFinite(requested) ? Math.min(base, Math.round(requested) + 5000) : base;
+}
+
+export async function runHelperWithInput(verb, opts, input, { timeoutMs } = {}) {
+  if (verb !== "clipboard-write") throw new Error("Standard input is only supported for clipboard-write.");
+  if (typeof input !== "string" || input.length === 0) throw new TypeError("Clipboard input must be a non-empty string.");
+  if (input.length > 8192 || Buffer.byteLength(input, "utf8") > 64 * 1024) throw new RangeError("Clipboard input exceeds the fixed size limit.");
+  if (process.platform !== "win32") throw new Error("hana-desktop-companion supports Windows only.");
+  if (process.arch !== "x64") throw new Error(`hana-desktop-companion requires Windows x64; current arch is ${process.arch}.`);
+
+  const child = spawn(HELPER_PATH, toArgv(verb, opts), {
+    windowsHide: true,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const stdout = [];
+  const stderr = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  const maxBuffer = 16 * 1024 * 1024;
+  const timer = setTimeout(() => child.kill(), timeoutMs ?? 20000);
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      child.stdout.on("data", (chunk) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxBuffer) {
+          child.kill();
+          reject(new Error("Native helper output exceeded the size limit."));
+          return;
+        }
+        stdout.push(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderrBytes += chunk.length;
+        if (stderrBytes <= 64 * 1024) stderr.push(chunk);
+      });
+      child.once("error", reject);
+      child.once("close", (code) => resolve({ code, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }));
+      child.stdin.once("error", () => {});
+      child.stdin.end(Buffer.from(input, "utf8"));
+    });
+    const lines = result.stdout.split(/\\r?\\n/).filter(Boolean);
+    const json = lines.at(-1);
+    if (!json) throw new Error(result.stderr ? "Native helper returned an error without JSON." : "Native helper produced no JSON.");
+    const parsed = JSON.parse(json);
+    if (result.code !== 0 && parsed?.ok !== false) throw new Error("Native clipboard write failed.");
+    return parsed;
+  } catch (err) {
+    if (err?.code === "ERR_ACCESS_DENIED" || /child process|allow-child-process|permission model/i.test(err?.message || "")) {
+      throw new Error("Native helper execution is blocked: this App has not been granted the 'app/process.spawn' capability.");
+    }
+    if (err?.code === "ENOENT") throw new Error("Native helper is missing from the App package.");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function runHelper(verb, opts, { timeoutMs } = {}) {

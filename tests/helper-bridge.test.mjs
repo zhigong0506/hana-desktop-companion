@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildHelperArgv } from "../app/hana-desktop-companion/lib/helper.js";
+import { buildHelperArgv, runHelperWithInput } from "../app/hana-desktop-companion/lib/helper.js";
 
 test("an unknown verb is refused, not passed through", () => {
   assert.throws(() => buildHelperArgv("run-anything", {}), /Unsupported helper verb/);
@@ -37,8 +37,18 @@ test("a false boolean emits nothing and a true boolean emits a presence flag", (
   assert.deepEqual(buildHelperArgv("clipboard-read", { hwnd: "1", execute: true }), ["clipboard-read", "--hwnd", "1", "--execute"]);
 });
 
-test("clipboard write is not a reachable verb", () => {
-  assert.throws(() => buildHelperArgv("clipboard-write", { text: "x" }), /Unsupported helper verb/);
+test("clipboard write carries binding flags but never its payload in argv", () => {
+  const argv = buildHelperArgv("clipboard-write", { hwnd: "1", expectedPid: 2, text: "SECRET-MARKER", maxChars: 8192, execute: true });
+  assert.deepEqual(argv, ["clipboard-write", "--hwnd", "1", "--expectedPid", "2", "--maxChars", "8192", "--execute"]);
+  assert.equal(JSON.stringify(argv).includes("SECRET-MARKER"), false);
+  assert.equal(argv.includes("--text"), false);
+});
+
+test("stdin payload bridge only supports bounded clipboard-write strings", async () => {
+  await assert.rejects(runHelperWithInput("send-keys", {}, "secret"), /only supported for clipboard-write/);
+  await assert.rejects(runHelperWithInput("clipboard-write", {}, ""), /non-empty string/);
+  await assert.rejects(runHelperWithInput("clipboard-write", {}, "x".repeat(8193)), /size limit/);
+  await assert.rejects(runHelperWithInput("clipboard-write", {}, "柠".repeat(22000)), /size limit/);
 });
 
 test("ordinary string flags strip control characters and are length-capped", () => {

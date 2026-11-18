@@ -17,7 +17,8 @@ Plugin repository: <https://github.com/zhigong0506/hana-desktop-companion> · Op
 - **Multi-monitor inventory**: virtual-desktop bounds plus each monitor's bounds / work area (physical pixels), primary flag, effective DPI and scale. Pure observation.
 - **Bounded wait-for**: wait for a window to disappear / become visible / become minimized / take the foreground, for a title to contain a string, for a UIA element to appear or vanish, or for a pixel to hit the bound window. Capped at 30s and returns `timedOut`. It returns an observation only — it never acts and never continues a plan.
 - **Restricted global shortcuts**: exactly one chord per call (e.g. `ctrl+shift+s`), inside a closed key/modifier allowlist. Any chord carrying the Win modifier, and a deny list of system-level chords (Win+L, Alt+F4, Ctrl+Shift+Esc, Ctrl+Alt+Delete, …), is refused; the bound window must actually be the foreground window right before injection.
-- **Clipboard read**: separate from keyboard input, treated as sensitive, off by default, truncated. Be aware that the text it reads is returned as the tool result, so it does enter the host/model context — this App only guarantees it is not written into a log line or an error detail. **Clipboard write is not implemented**: it would have to carry plaintext on the helper's command line, where any local process can read it.
+- **Clipboard read**: sensitive and off by default; returned text enters the host/model context.
+- **Clipboard write**: destructive and dry-run by default. Non-credential text is capped at 8,192 characters / 64 KiB UTF-8, sent over stdin (not argv or disk), and omitted from the receipt. The host may retain tool arguments. Combined with a separately reviewed `Ctrl+V`, this can paste tool-supplied text into the foreground app.
 - **Guarded advanced actions**: drag, wheel (semantics UIA cannot express) and window management (move / resize / minimize / maximize / restore / graceful `WM_CLOSE`). **All dryRun by default**; real injection needs `execute=true` plus every gate.
 - **Screenshots delivered as session files**: the PNG is copied into the session as an artifact, readable by the model and retained for the user.
 
@@ -46,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 
 `ok` should be `true`, and `windows`, `x64Process`, `dotnet8WindowsDesktopRuntime`, `nativeHelperExists`, `nativeHelperSmokeTest` should all be `true`. You can also confirm the runtime with `dotnet --list-runtimes` (needs `Microsoft.WindowsDesktop.App 8.0.x`).
 
-## Tools (13)
+## Tools (14)
 
 | Tool | Risk tier | Default behavior |
 |---|---|---|
@@ -60,6 +61,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 | `desktop_mouse_drag` / `desktop_mouse_wheel` | destructive | **dryRun by default**, as above |
 | `desktop_send_keys` | sensitive | **dryRun by default**; needs a foreground hwnd+expectedPid binding and passes the chord screen first |
 | `desktop_clipboard_read` | sensitive | **dryRun by default**; reads truncated, receipts carry sizes only |
+| `desktop_clipboard_write` | destructive | **dryRun by default**; stdin payload, size limits, receipt only |
 
 ## Safety and privacy boundaries (defense in depth; host review is always the outer layer)
 
@@ -68,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 - The default `actionPolicy` (`destructive-only`) does **not** admit sensitive actions, so keyboard and clipboard verbs need an explicit switch to `sensitive-and-destructive` even after `allowRealInput` is on.
 - Keyboard input is confined to a fixed key allowlist (letters, digits, F1–F12, navigation keys) and a fixed modifier allowlist (ctrl/alt/shift). **Every chord carrying the Win modifier is refused**, plus a deny list of system-level chords (Win+L, Win+R, Alt+F4, Alt+Tab, Ctrl+Shift+Esc, Ctrl+Alt+Delete, Ctrl+Esc, Alt+Space, …). Each call is limited to a single chord. Free-text typing is not offered.
 - Before injecting keys the helper verifies the bound window **is** the current foreground window and re-checks the PID; otherwise it refuses (`target-not-foreground` / `pid-changed`). On a secure desktop (lock screen, UAC) keyboard and clipboard operations are refused.
-- Clipboard: **read only**, sensitive and off by default, capped at 4000 characters (default 2000). Receipts report sizes and truncation; the text itself is returned to the caller and does reach the host/model context. This App does not write it to a log or an error detail, and makes no claim about the host's own session storage. The clipboard is process-global, so the bound HWND is an audit anchor, not a delivery target.
+- Clipboard reads are sensitive, off by default, and capped at 4000 characters (default 2000); returned content enters the host/model context. Writes are destructive and dry-run by default, capped at 8,192 characters / 64 KiB UTF-8, and delivered over stdin without argv or temporary files. Write receipts omit the payload; tool arguments may still be retained by the host. The clipboard is process-global, so the bound HWND is only an audit anchor. A separate reviewed `Ctrl+V` can paste the written text into the foreground app.
 - A confirmation phrase echoed by the model is an acknowledgement only — **never** user approval.
 - Real input requires a fresh `hwnd` + `expectedPid` binding and re-runs `WindowFromPoint` immediately before injection; if focus drifts and the pixel no longer resolves to the target, it refuses (verified live).
 - `close` demands an explicit `hwnd` and rejects title/foreground matching; it uses `WM_CLOSE`, so the app may still prompt and the user may cancel.
@@ -83,7 +85,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-environment.ps1
 
 **Not supported**: macOS, Linux, Windows x86 / ARM64 (unverified); UAC secure desktop, lock screen and other secure-desktop content; DRM/HDCP-protected or screenshot-blocked content; full-screen or target-less capture; persistent background observation or timed screenshots.
 
-**Deliberately not implemented**: OCR (no engine is bundled and no arbitrary image path or full-screen image is accepted — hand the session image from `desktop_window_capture` to the host or an external OCR step); app launch; process / registry / filesystem inventory; arbitrary shell or executable; batch action plans; free-text typing; clipboard write (it would have to carry plaintext on the helper's command line). `desktop_capabilities` reports these as unsupported rather than pretending otherwise.
+**Deliberately not implemented**: OCR (no engine is bundled and no arbitrary image path or full-screen image is accepted — hand the session image from `desktop_window_capture` to the host or an external OCR step); app launch; process / registry / filesystem inventory; arbitrary shell or executable; batch action plans; free-text typing as a dedicated keyboard tool. `desktop_capabilities` reports unsupported items rather than pretending otherwise. Clipboard write is implemented as a gated, destructive tool; see the safety section and validation note.
 
 **Honest verification note**: drag's *visible* selection effect and wheel's *one successful render* were not separately captured in a live session — the Windows foreground lock prevented the test process from stably raising the self-built fixture, so the hit guard correctly refused blind injection at drifted coordinates (by design, not a defect). Both share the same helper Win32 injection path as the evidenced window actions and pass at the logic level. See [docs/VALIDATION.md](docs/VALIDATION.md).
 

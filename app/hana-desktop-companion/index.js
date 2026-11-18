@@ -1,7 +1,7 @@
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { runHelper } from "./lib/helper.js";
+import { runHelper, runHelperWithInput } from "./lib/helper.js";
 import {
   CONFIRM_PHRASE,
   resolveConfig,
@@ -13,9 +13,12 @@ import { screenShortcut } from "./lib/shortcuts.js";
 import { normalizeWaitFor, WAIT_FOR_FIELDS, WAIT_CONDITIONS } from "./lib/waitfor.js";
 import {
   normalizeClipboardRead,
+  normalizeClipboardWrite,
   clipboardReceipt,
   redactForLog,
   CLIPBOARD_READ_MAX_CHARS,
+  CLIPBOARD_WRITE_MAX_BYTES,
+  CLIPBOARD_WRITE_MAX_CHARS,
 } from "./lib/clipboard.js";
 
 // Hana Desktop Companion — v2 App.
@@ -29,11 +32,9 @@ import {
 //   - guarded advanced input (drag / wheel / keyboard chords) and window
 //     management (move / resize / minimize / maximize / restore / graceful
 //     close);
-//   - multi-monitor inventory, bounded wait-for observation, and a gated
-//     clipboard read (sensitive and truncated; the reply text goes to the
-//     caller, but never into a log line or an error detail). Clipboard write is
-//     deliberately absent: a plaintext payload would have to cross the helper's
-//     command line, where any local process could read it.
+//   - multi-monitor inventory, bounded wait-for observation, and gated
+//     clipboard read/write. Write text travels over helper stdin, not argv or
+//     disk; the tool call itself may be retained by Hana's host.
 //
 // Safety posture (defence in depth, host review is always the outer layer):
 //   - Observation tools are declared readOnly. Capture is NOT, because its
@@ -352,7 +353,35 @@ export default defineApp(async (sdk) => {
     },
   });
 
-  // 13) capabilities — read-only status receipt
+  // 13) clipboard-write — destructive, stdin-only payload, receipt only
+  await sdk.tools.register({
+    name: "desktop_clipboard_write",
+    description:
+      `将非凭据纯文本写入系统剪贴板（destructive，默认 execute=false 只做计划；真实写入需 allowRealInput + actionPolicy 允许 destructive + HWND/PID 绑定 + 确认短语 + 宿主逐次审阅）。正文经 stdin 传给固定 helper，不进进程命令行或临时文件；但正文作为工具参数发送给 Hana，可能进入宿主会话记录。仅接受 1–${CLIPBOARD_WRITE_MAX_CHARS} 字符且 UTF-8 不超过 ${CLIPBOARD_WRITE_MAX_BYTES} 字节的非空文本，超限拒绝、不截断；返回长度与剪贴板序号，不回显正文。`,
+    parameters: {
+      type: "object",
+      properties: {
+        ...boundTargetProps,
+        text: { type: "string", minLength: 1, maxLength: CLIPBOARD_WRITE_MAX_CHARS, description: "非凭据纯文本；会进入本次工具调用，可能被宿主记录。" },
+        execute: { type: "boolean", description: "默认 false=只预览，不接触剪贴板。" },
+        confirmation: { type: "string", description: `真实写入须回填：${CONFIRM_PHRASE}。` },
+      },
+      required: ["hwnd", "expectedPid", "text"],
+    },
+    execute: async (args = {}) => {
+      const normalized = normalizeClipboardWrite(args);
+      if (!normalized.ok) return json({ requestedExecute: args.execute === true, executed: false, blockedBy: normalized.error, ...(normalized.chars === undefined ? {} : { chars: normalized.chars, bytes: normalized.bytes, maxChars: normalized.maxChars, maxBytes: normalized.maxBytes }) });
+      const config = await resolveConfig(sdk);
+      const verdict = evaluateRealAction({ config, verb: "clipboard-write", confirmation: args.confirmation, requiresTarget: hasTargetBinding(args) });
+      if (args.execute !== true) return json({ requestedExecute: false, executed: false, plannedChars: normalized.chars, plannedBytes: normalized.bytes, targetBound: hasTargetBinding(args), note: "Clipboard unchanged; text was not sent to the helper." });
+      if (!verdict.allowed) return json({ requestedExecute: true, executed: false, blockedBy: verdict.reason, risk: verdict.risk });
+      const forwarded = await runHelperWithInput("clipboard-write", { hwnd: args.hwnd, expectedPid: args.expectedPid, maxChars: CLIPBOARD_WRITE_MAX_CHARS, execute: true }, args.text);
+      const receipt = forwarded?.ok === true ? { ok: true, action: "clipboard-write", target: forwarded.target, chars: forwarded.chars, bytes: forwarded.bytes, seqBefore: forwarded.seqBefore, seqAfter: forwarded.seqAfter, changed: forwarded.changed } : redactForLog(forwarded);
+      return json({ requestedExecute: true, risk: verdict.risk, gate: verdict.reason, forwarded: receipt });
+    },
+  });
+
+  // 14) capabilities — read-only status receipt
   await sdk.tools.register({
     name: "desktop_capabilities",
     description:
@@ -392,6 +421,7 @@ export default defineApp(async (sdk) => {
           "desktop_wait_for",
           "desktop_send_keys",
           "desktop_clipboard_read",
+          "desktop_clipboard_write",
           "desktop_capabilities",
         ],
         notImplemented: [
@@ -401,7 +431,9 @@ export default defineApp(async (sdk) => {
           "arbitrary shell or executable",
           "batch action plans",
           "full-screen capture",
-          "clipboard write (a plaintext payload would have to cross the helper's command line, which any local process can read; not implemented rather than claimed safe)",
+        ],
+        securityNotes: [
+          "Clipboard write plus a separately reviewed Ctrl+V can paste tool-supplied text into the foreground app; use only non-credential text and review each call.",
         ],
       });
     },

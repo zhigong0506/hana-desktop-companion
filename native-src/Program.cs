@@ -48,12 +48,10 @@ namespace HanaDesktopCompanion;
 //   - send-keys: fixed key table + chord denylist. The bound HWND must be the
 //     foreground window, re-verified immediately before SendInput. Any chord
 //     carrying the Win modifier is refused outright.
-//   - clipboard-read: gated and truncated. The bound window is an audit anchor,
-//     not a delivery target: the Windows clipboard is process-global. The reply
-//     text is the deliverable and does go to the caller; it is never written to
-//     a log line or an error detail. Clipboard *write* is deliberately not
-//     implemented — a plaintext payload would have to cross this helper's
-//     command line, where any process on the machine can read it.
+//   - clipboard-read/write: gated operations. The bound window is an audit
+//     anchor, not an enforcement boundary: the Windows clipboard is process-global.
+//     Read text is returned to the caller; write text arrives over stdin, never
+//     argv or disk, and only a size/sequence receipt is returned.
 //   - capabilities: a receipt naming the verb surface and what is deliberately
 //     not implemented.
 //   - ParseFlags no longer mistakes a negative number ("-3") for a flag, and an
@@ -89,6 +87,7 @@ internal static class Program
                 "wait-for" => WaitFor(flags),
                 "send-keys" => SendKeys(flags),
                 "clipboard-read" => ClipboardRead(flags),
+                "clipboard-write" => ClipboardWrite(flags),
                 "capabilities" => Capabilities(),
                 _ => throw new ArgumentException($"Unsupported verb: {verb}")
             };
@@ -104,7 +103,7 @@ internal static class Program
         }
     }
 
-    private const string HelperVersion = "0.2.0";
+    private const string HelperVersion = "0.2.1";
 
     // Per-verb closed flag surface, mirroring the JS bridge allowlist. An
     // unlisted flag is rejected here too, so a bridge bug cannot widen the
@@ -124,6 +123,7 @@ internal static class Program
         ["wait-for"] = new[] { "condition", "hwnd", "title", "foreground", "expectedPid", "query", "role", "x", "y", "timeoutMs", "intervalMs" },
         ["send-keys"] = new[] { "chord", "holdMs", "hwnd", "expectedPid", "execute" },
         ["clipboard-read"] = new[] { "hwnd", "expectedPid", "maxChars", "execute" },
+        ["clipboard-write"] = new[] { "hwnd", "expectedPid", "maxChars", "execute" },
         ["capabilities"] = Array.Empty<string>(),
     };
 
@@ -1180,6 +1180,78 @@ internal static class Program
         }
     }
 
+    private const int ClipboardWriteMaxBytes = 64 * 1024;
+    private const int ClipboardWriteMaxChars = 8192;
+
+    private static object ClipboardWrite(Dictionary<string, string?> o)
+    {
+        var target = ResolveTarget(o);
+        var maxChars = Math.Clamp(Int(o, "maxChars", ClipboardWriteMaxChars), 1, ClipboardWriteMaxChars);
+        if (!Flag(o, "execute"))
+            return new { ok = true, dryRun = true, action = "clipboard-write", maxChars, target = new { target.Hwnd, target.Pid, target.Title }, note = "Clipboard unchanged; stdin was not read." };
+
+        if (IsSecureDesktopActive())
+            return new { ok = false, blockedBy = "secure-desktop", action = "clipboard-write" };
+
+        byte[] payload;
+        try
+        {
+            using var buffer = new MemoryStream();
+            var input = Console.OpenStandardInput();
+            var chunk = new byte[4096];
+            while (true)
+            {
+                var read = input.Read(chunk, 0, chunk.Length);
+                if (read == 0) break;
+                if (buffer.Length + read > ClipboardWriteMaxBytes)
+                    return new { ok = false, error = "payload-too-large", maxBytes = ClipboardWriteMaxBytes };
+                buffer.Write(chunk, 0, read);
+            }
+            payload = buffer.ToArray();
+        }
+        catch
+        {
+            return new { ok = false, error = "stdin-unavailable" };
+        }
+
+        try
+        {
+            var encoding = new UTF8Encoding(false, true);
+            var offset = payload.Length >= 3 && payload[0] == 0xEF && payload[1] == 0xBB && payload[2] == 0xBF ? 3 : 0;
+            var text = encoding.GetString(payload, offset, payload.Length - offset);
+            if (text.Length == 0) return new { ok = false, error = "text-empty" };
+            if (text.Length > maxChars || text.Length > ClipboardWriteMaxChars)
+                return new { ok = false, error = "payload-too-large", maxChars = ClipboardWriteMaxChars, maxBytes = ClipboardWriteMaxBytes };
+
+            var seqBefore = Native.GetClipboardSequenceNumber();
+            try
+            {
+                System.Windows.Forms.Clipboard.SetText(text, System.Windows.Forms.TextDataFormat.UnicodeText);
+            }
+            catch (System.Runtime.InteropServices.ExternalException)
+            {
+                Thread.Sleep(60);
+                try { System.Windows.Forms.Clipboard.SetText(text, System.Windows.Forms.TextDataFormat.UnicodeText); }
+                catch (System.Runtime.InteropServices.ExternalException)
+                {
+                    Thread.Sleep(60);
+                    try { System.Windows.Forms.Clipboard.SetText(text, System.Windows.Forms.TextDataFormat.UnicodeText); }
+                    catch (System.Runtime.InteropServices.ExternalException) { return new { ok = false, error = "clipboard-unavailable" }; }
+                }
+            }
+            var seqAfter = Native.GetClipboardSequenceNumber();
+            return new { ok = true, action = "clipboard-write", target = new { target.Hwnd, target.Pid, target.Title }, chars = text.Length, bytes = payload.Length - offset, seqBefore, seqAfter, changed = seqAfter != seqBefore };
+        }
+        catch (DecoderFallbackException)
+        {
+            return new { ok = false, error = "invalid-utf8" };
+        }
+        catch
+        {
+            return new { ok = false, error = "clipboard-write-failed" };
+        }
+    }
+
     // ---------------- capabilities (READ-ONLY receipt) ----------------
 
     private static object Capabilities() => new
@@ -1194,11 +1266,11 @@ internal static class Program
         coordinateSpace = "physical-pixels",
         verbs = AllowedFlags.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray(),
         readOnlyVerbs = new[] { "capabilities", "hit-test", "list-displays", "list-windows", "uia-find", "uia-tree", "verify-target", "wait-for" },
-        gatedVerbs = new[] { "capture-window", "clipboard-read", "manage-window", "mouse-drag", "mouse-wheel", "send-keys" },
+        gatedVerbs = new[] { "capture-window", "clipboard-read", "clipboard-write", "manage-window", "mouse-drag", "mouse-wheel", "send-keys" },
         unsupported = new[]
         {
             "ocr", "app-launch", "process-list", "registry", "filesystem",
-            "shell", "batch-plan", "full-screen-capture", "clipboard-write"
+            "shell", "batch-plan", "full-screen-capture"
         }
     };
 
@@ -1640,6 +1712,7 @@ internal static class Native
     [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfo info);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
     [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseDesktop(IntPtr desktop);

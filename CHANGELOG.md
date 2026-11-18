@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 The format follows Keep a Changelog; this project uses Semantic Versioning.
 
+## [0.2.1] - 2026-11-18
+
+### Added
+- `desktop_clipboard_write` as a destructive, dry-run-by-default action. Text is
+  UTF-8 stdin only (never argv or a temporary file), bounded to 8,192 chars / 64
+  KiB, and omitted from the result receipt. Tool arguments may still be retained
+  by Hana; use only for non-credential text. Combined with a separately
+  reviewed `Ctrl+V`, this can paste tool-supplied text into the foreground app.
+- Clipboard writes are bound to a fresh HWND+PID, gated by `allowRealInput`, the
+  destructive action policy, a confirmation acknowledgement, and host review.
+
+### Security
+- Oversize and invalid UTF-8 payloads are rejected without writing; native errors
+  and receipts never include clipboard text.
+
 ## [0.2.0] - 2026-11-18
 
 Incremental extension inside the existing v2 App. The host's per-call review,

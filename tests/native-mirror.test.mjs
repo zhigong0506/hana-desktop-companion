@@ -89,29 +89,29 @@ test("every native verb is reachable through the bridge", () => {
 // actually observed there.
 // ---------------------------------------------------------------------------
 
-test("clipboard write has no implementation anywhere in the shipped surface", async () => {
+test("clipboard write is gated, target-bound, and stdin-only", async () => {
   const appDir = path.resolve(here, "..", "app", "hana-desktop-companion");
-  const [index, ...libs] = await Promise.all(
+  const [index, helper, gates, clipboard] = await Promise.all(
     ["index.js", "lib/helper.js", "lib/gates.js", "lib/clipboard.js"].map((relative) =>
       fs.readFile(path.join(appDir, relative), "utf8"),
     ),
   );
-
-  // JS surface: no verb, no risk classification, no target binding, no tool.
-  assert.equal(helperVerbSurface()["clipboard-write"], undefined);
-  assert.equal(ACTION_RISK["clipboard-write"], undefined);
-  assert.equal(TARGET_REQUIRED.has("clipboard-write"), false);
-  assert.equal(typeof clipboardModule.normalizeClipboardWrite, "undefined");
-  assert.equal(/name: "desktop_clipboard_write"/.test(index), false);
-
-  // Native surface: no handler, no allowlist entry, no clipboard write call.
-  assert.equal(/"clipboard-write" =>/.test(source), false);
-  assert.equal(/private static object ClipboardWrite/.test(source), false);
-  assert.equal(/Clipboard\.SetText/.test([source, ...libs].join("\n")), false);
-
-  // The only permitted mention is the capabilities receipt naming it unsupported.
-  const mentions = [...source.matchAll(/clipboard-write/g)].length;
-  assert.equal(mentions, 1, "Program.cs should mention clipboard-write only in the unsupported list");
+  assert.ok(helperVerbSurface()["clipboard-write"]);
+  assert.equal(ACTION_RISK["clipboard-write"], "destructive");
+  assert.equal(TARGET_REQUIRED.has("clipboard-write"), true);
+  assert.match(index, /name: "desktop_clipboard_write"/);
+  assert.match(index, /Clipboard write plus a separately reviewed Ctrl\+V/);
+  assert.match(index, /if \(args\.execute !== true\)[\s\S]*?Clipboard unchanged; text was not sent to the helper/);
+  assert.match(helper, /runHelperWithInput/);
+  assert.match(clipboard, /CLIPBOARD_WRITE_MAX_BYTES/);
+  assert.match(source, /"clipboard-write" => ClipboardWrite\(flags\)/);
+  assert.match(source, /private static object ClipboardWrite/);
+  assert.match(source, /Clipboard\.SetText\(text/);
+  assert.match(source, /GetClipboardSequenceNumber/);
+  assert.doesNotMatch(source, /"clipboard-write"\].*"text"/);
+  assert.match(source, /catch \(DecoderFallbackException\)[\s\S]*?"invalid-utf8"/);
+  assert.match(source, /"payload-too-large"/);
+  assert.match(gates, /"clipboard-write": "destructive"/);
 });
 
 test("wait-for binds the resolved PID even when the caller omits expectedPid", () => {

@@ -11,13 +11,26 @@
 // session storage — only that this App never writes the content into a log line
 // or an error message.
 //
-// There is no write path: a plaintext payload would have to cross the helper's
-// command line, where any local process can read it.
+// Writes use the fixed helper's stdin pipe, never argv or a temporary file.
+// The caller's text still travels in Hana's tool call and may be session-recorded.
 
 export const CLIPBOARD_READ_DEFAULT_CHARS = 2000;
 export const CLIPBOARD_READ_MAX_CHARS = 4000;
+export const CLIPBOARD_WRITE_MAX_BYTES = 64 * 1024;
+export const CLIPBOARD_WRITE_MAX_CHARS = 8192;
 
 const SENSITIVE_KEYS = new Set(["text", "content", "clipboard", "clipboardtext", "clipboard_text"]);
+
+export function normalizeClipboardWrite(args = {}) {
+  if (typeof args.text !== "string") return { ok: false, error: "text-required" };
+  const chars = args.text.length;
+  const bytes = Buffer.byteLength(args.text, "utf8");
+  if (chars === 0) return { ok: false, error: "text-empty" };
+  if (chars > CLIPBOARD_WRITE_MAX_CHARS || bytes > CLIPBOARD_WRITE_MAX_BYTES) {
+    return { ok: false, error: "payload-too-large", chars, bytes, maxChars: CLIPBOARD_WRITE_MAX_CHARS, maxBytes: CLIPBOARD_WRITE_MAX_BYTES };
+  }
+  return { ok: true, chars, bytes, maxChars: CLIPBOARD_WRITE_MAX_CHARS, maxBytes: CLIPBOARD_WRITE_MAX_BYTES };
+}
 
 export function normalizeClipboardRead(args = {}) {
   const raw = Number(args.maxChars);

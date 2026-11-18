@@ -31,10 +31,10 @@ export const ACTION_RISK = {
   "mouse-wheel": "destructive",
   // Keyboard input and clipboard reads are sensitive by construction: a chord
   // reaches whatever holds the foreground, and clipboard content is user data.
-  // There is no clipboard-write verb: it would have to carry plaintext over the
-  // helper's command line, so it is deliberately not implemented.
+  // Clipboard access is sensitive user data; writes are separately host-reviewed.
   "send-keys": "sensitive",
   "clipboard-read": "sensitive",
+  "clipboard-write": "destructive",
 };
 
 const POLICY_ALLOW = {
@@ -107,6 +107,7 @@ export const TARGET_REQUIRED = new Set([
   "mouse-wheel",
   "send-keys",
   "clipboard-read",
+  "clipboard-write",
 ]);
 
 export function hasTargetBinding(input) {

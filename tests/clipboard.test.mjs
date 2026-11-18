@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 
 import * as clipboard from "../app/hana-desktop-companion/lib/clipboard.js";
 
-const { CLIPBOARD_READ_DEFAULT_CHARS, CLIPBOARD_READ_MAX_CHARS, clipboardReceipt, normalizeClipboardRead, redactForLog } =
+const { CLIPBOARD_READ_DEFAULT_CHARS, CLIPBOARD_READ_MAX_CHARS, CLIPBOARD_WRITE_MAX_BYTES, CLIPBOARD_WRITE_MAX_CHARS, clipboardReceipt, normalizeClipboardRead, normalizeClipboardWrite, redactForLog } =
   clipboard;
 
 test("the read budget defaults low and is capped", () => {
@@ -53,10 +53,12 @@ test("redaction leaves non-sensitive shapes alone", () => {
   assert.deepEqual(redactForLog(payload), payload);
 });
 
-test("the module exposes no write path", () => {
-  assert.equal(typeof clipboard.normalizeClipboardWrite, "undefined");
-  assert.equal(typeof clipboard.CLIPBOARD_WRITE_MAX_CHARS, "undefined");
-  for (const name of Object.keys(clipboard)) {
-    assert.equal(/write/i.test(name), false, `unexpected write-related export: ${name}`);
-  }
+test("write input is non-empty, bounded, and rejected rather than truncated", () => {
+  assert.deepEqual(normalizeClipboardWrite({}), { ok: false, error: "text-required" });
+  assert.deepEqual(normalizeClipboardWrite({ text: "" }), { ok: false, error: "text-empty" });
+  assert.equal(normalizeClipboardWrite({ text: "柠" }).ok, true);
+  assert.deepEqual(normalizeClipboardWrite({ text: "x".repeat(CLIPBOARD_WRITE_MAX_CHARS + 1) }).error, "payload-too-large");
+  assert.equal(normalizeClipboardWrite({ text: "柠".repeat(CLIPBOARD_WRITE_MAX_BYTES / 3 + 1) }).error, "payload-too-large");
+  assert.equal(CLIPBOARD_WRITE_MAX_CHARS, 8192);
+  assert.equal(CLIPBOARD_WRITE_MAX_BYTES, 65536);
 });

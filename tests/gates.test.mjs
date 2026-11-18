@@ -54,12 +54,10 @@ test("every new verb is classified; keyboard and clipboard reads are at least se
   assert.equal(ACTION_RISK["send-keys"], "sensitive");
 });
 
-// Clipboard write carries plaintext over the helper's command line, so it was
-// removed rather than gated. An unclassified verb must stay "unknown" (which no
-// policy admits) instead of silently inheriting a tier.
-test("clipboard write is not a classified action", () => {
-  assert.equal(riskOf("clipboard-write"), "unknown");
-  assert.equal(TARGET_REQUIRED.has("clipboard-write"), false);
+test("clipboard write is destructive and requires a target binding", () => {
+  assert.equal(riskOf("clipboard-write"), "destructive");
+  assert.equal(ACTION_RISK["clipboard-write"], "destructive");
+  assert.equal(TARGET_REQUIRED.has("clipboard-write"), true);
 });
 
 test("observation verbs stay allowed with real input disabled", () => {
