@@ -1,9 +1,10 @@
 // lib/gates.js — the App-level real-action gate.
 //
 // Two independent things must both say yes before anything is injected:
-//   1. The HOST has reviewed this call (it always will: no tool below declares
-//      sessionPermission.readOnly, and none claims auto:"allow"). That is the
-//      permission ledger's job and this App must not pretend to replace it.
+//   1. The HOST has reviewed this call (mutating tools never declare
+//      sessionPermission.readOnly or auto:"allow"; only observation tools do).
+//      That is the permission ledger's job and this App must not pretend to
+//      replace it.
 //   2. The App's own opt-in switch `allowRealInput` is on (default off) and the
 //      action is inside the user's declared actionPolicy.
 //
@@ -17,6 +18,9 @@ export const ACTION_RISK = {
   "uia-find": "read",
   "hit-test": "read",
   "verify-target": "read",
+  "list-displays": "read",
+  "wait-for": "read",
+  "capabilities": "read",
   "manage-window:minimize": "sensitive",
   "manage-window:restore": "sensitive",
   "manage-window:maximize": "sensitive",
@@ -25,6 +29,12 @@ export const ACTION_RISK = {
   "manage-window:close": "destructive",
   "mouse-drag": "destructive",
   "mouse-wheel": "destructive",
+  // Keyboard input and clipboard reads are sensitive by construction: a chord
+  // reaches whatever holds the foreground, and clipboard content is user data.
+  // There is no clipboard-write verb: it would have to carry plaintext over the
+  // helper's command line, so it is deliberately not implemented.
+  "send-keys": "sensitive",
+  "clipboard-read": "sensitive",
 };
 
 const POLICY_ALLOW = {
@@ -33,6 +43,11 @@ const POLICY_ALLOW = {
   "destructive-only": ["destructive"],
   read: [],
 };
+
+/** Risk tiers the named policy admits. Unknown policies fall back to the strictest. */
+export function allowedRiskTiers(policy) {
+  return POLICY_ALLOW[policy] ?? POLICY_ALLOW["destructive-only"];
+}
 
 // v2 App convenience members are async (they cross the App RPC boundary), so
 // config.get must be awaited. Await failures fall back to the safest defaults
@@ -82,7 +97,17 @@ export function evaluateRealAction({ config, verb, action, confirmation, require
   return { allowed: true, risk, reason: "approved-by-app-gate" };
 }
 
-export const TARGET_REQUIRED = new Set(["capture-window", "uia-tree", "uia-find", "verify-target", "manage-window", "mouse-drag", "mouse-wheel"]);
+export const TARGET_REQUIRED = new Set([
+  "capture-window",
+  "uia-tree",
+  "uia-find",
+  "verify-target",
+  "manage-window",
+  "mouse-drag",
+  "mouse-wheel",
+  "send-keys",
+  "clipboard-read",
+]);
 
 export function hasTargetBinding(input) {
   return Boolean(input?.hwnd) && Number.isFinite(Number(input?.expectedPid));

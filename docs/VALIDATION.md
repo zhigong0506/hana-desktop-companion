@@ -1,4 +1,7 @@
-# Validation report — hana-desktop-companion v0.1.1
+# Validation report — hana-desktop-companion v0.1.1 / v0.2.0
+
+Sections 1–7 record the v0.1.1 acceptance run. Section 8 records the v0.2.0
+increment and, importantly, what it does **not** cover.
 
 Environment: HanaAgent `1.0.6-beta`, Windows 11 x64, .NET 8 Windows Desktop Runtime x64.
 
@@ -131,3 +134,103 @@ render were not obtained, for the environment and design reasons described in §
   when testing is finished. This App never edits that preference by itself.
 - The two upstream v1 plugins were left completely unmodified throughout, so a
   rollback is always available.
+
+## 8. v0.2.0 increment (current tree)
+
+Scope of the increment: `list-displays`, `wait-for`, `send-keys`,
+`clipboard-read`, `capabilities`, plus the `ParseFlags` fix. Clipboard **write**
+was investigated and removed: it would have to carry plaintext on the helper's
+process command line, where any local process can read it. No plugin-side
+approval ledger, control session, global keyboard hook or overlay was added.
+
+This section was rewritten after the safety patch. It reports only checks run
+against the **current** source tree and the freshly rebuilt helper; the package
+hash and packaging rows from the earlier draft were removed because this task
+does not pack or change generated packages.
+
+### 8.1 Logic level [B] — executed on this tree
+
+| Check | Command | Result |
+|---|---|---|
+| Helper compiles | `dotnet build native-src/HanaDesktopCompanion.Helper.csproj -c Release` | success, 0 warnings, 0 errors |
+| JS syntax | `node --check` × 6 files | 6/6 OK |
+| Pure-logic suite | `node --test "tests/*.test.mjs"` | **57 pass, 0 fail** |
+| JS/native parity | `tests/native-mirror.test.mjs` | pass — parses `Program.cs`; also guards the removed clipboard-write verb and the wait / secure-desktop fail-closed branches |
+| Official static validation | `validate-app.mjs --dir app/hana-desktop-companion` | **0 error(s), 0 warning(s)** |
+
+The suite pins: default refusal with real input off; action-policy tiering;
+missing target binding; the confirmation phrase as acknowledgement only; the
+fixed chord denylist and single-chord-per-call rule; bounded wait timeouts; the
+closed argv surface (including dropping `thenKeys` and `--text`); size-only read
+receipts and text redaction. The removal guards are **source-shape assertions**,
+not runtime proof — they catch reintroduction and dropped branches, not Win32
+behaviour.
+
+### 8.2 Read-only live checks [B] — executed against the rebuilt helper
+
+The rebuilt helper copied into `app/hana-desktop-companion/native/` was invoked
+directly. Only observation verbs and dryRun/refusal paths were used: no window
+was moved, no key was injected, and the clipboard was not read or written.
+
+| Verb / call | Actual result | Result |
+|---|---|---|
+| `capabilities` | version `0.2.0`, 14 verbs; `clipboard-write` absent from `verbs` and listed in `unsupported` | pass |
+| `list-displays` | 1 monitor, 2560×1440 physical, DPI 120 (125%), primary index 0 | pass |
+| `wait-for window-gone`, dead handle, no PID | `satisfied:true`, `originalTargetGone:true`, 1 poll | pass |
+| `wait-for window-gone`, dead handle, with PID | `satisfied:true`, `originalTargetGone:true`, 1 poll | pass (no reuse detected on a dead handle) |
+| `wait-for element-gone`, impossible query on a live bound window, 250 ms | `satisfied:true`, `uiaComplete:true` in 1 poll — a complete walk with no match | pass |
+| `wait-for --condition nope` | `Unsupported wait condition …`, non-zero exit | pass |
+| `list-windows --evil 1` | `Unsupported flag for 'list-windows': --evil` | pass |
+| `mouse-wheel --notches -3` (dryRun) | `notches:-3` in the plan | pass (ParseFlags negative-value regression) |
+| `send-keys --chord win+l` | `The 'win' modifier is refused …` | pass |
+| `send-keys --thenKeys tab,enter` | `Unsupported flag for 'send-keys': --thenKeys` — the flag no longer exists; the earlier draft's “requires --chord” wording was wrong | pass (corrected) |
+| `send-keys --text hello` | `Unsupported flag for 'send-keys': --text` — no plaintext payload path | pass |
+| `send-keys --chord ctrl+shift+s` (dryRun, bound) | `dryRun:true`, single `chord`, `targetIsForeground` reported, zero injection | pass |
+| `clipboard-read` (dryRun, bound) | `dryRun:true`, `maxChars:2000`, no clipboard access | pass |
+| `clipboard-write --text …` | `Unsupported verb: clipboard-write` | pass (removal confirmed) |
+
+### 8.3 Not tested / cannot be claimed — stated plainly
+
+- **No real key injection.** `send-keys` with `execute=true` was not run. The
+  `SendInput` path, the finally-release behaviour, the foreground re-verification
+  race and the secure-desktop refusal have not been exercised on a live desktop.
+- **No real clipboard read.** Only the dryRun plan was observed. Actual
+  truncation against a real clipboard and the clipboard-busy retry path are
+  unproven. Clipboard write does not exist.
+- **WaitFor handle reuse is not runtime-proven.** No fixture was built in which
+  a bound HWND was recycled into another PID while a wait was in flight. The
+  binding (`boundPid = target.Pid`), the per-poll re-check and the
+  `handle-reused` abort are covered by source-shape guards only.
+- **UIA incompleteness is not runtime-proven.** `element-gone` was observed
+  returning satisfied only on a complete walk. A tree exceeding the 4000-node
+  budget, or a partially unreadable tree, was not constructed; the
+  `uiaComplete:false` path is a source-shape guard, not an observed outcome.
+- **Secure desktop identity comparison is not runtime-proven.** No lock screen
+  or UAC prompt was created. Only the source shape (input-desktop name compared
+  with thread-desktop name, refuse when unverifiable) is pinned.
+- **No end-to-end [A] host-channel run on this tree.** Tool registration, the
+  readOnly declaration taking effect and the host's review prompt for the new
+  sensitive tools were not exercised in a live Hana session.
+- **Official runtime smoke was unavailable**: `SMOKE_NODE_RUNTIME_UNAVAILABLE`
+  (smoke host requires Node 26+, this machine has 25.2.1 and no cached platform
+  runtime).
+- **Package verification:** after the safety fixes, the main agent rebuilt the
+  helper, repacked the App and ran official static directory and archive
+  validation (0 errors, 0 warnings). The ZIP SHA-256 matches the entry record:
+  `edd627318320cac2cebfd97352824a2bc5e1926224e347b62b5e73dc41ce9f1e`.
+  The packaged helper DLL's SHA-256 matches the current App DLL. These checks
+  do not replace isolated startup or live host-channel validation.
+- **OCR is not supported and was not attempted.** The hand-off point is the
+  session image from `desktop_window_capture`; no arbitrary image path or
+  full-screen OCR exists.
+- **Multi-monitor geometry was observed on a single-monitor machine only.**
+  Cross-monitor coordinates, mixed DPI and a negative-origin virtual desktop
+  are untested.
+
+### 8.4 Build artifacts
+
+The rebuilt helper was copied into `app/hana-desktop-companion/native/`;
+`hana-desktop-companion-helper.dll` is 119296 bytes (pre-patch build was
+113664). `native-src/publish/` is an untracked local publish directory produced
+by the main agent; it was not modified or deleted and must not be committed.
+No signing was performed and no private key was read, used or stored.

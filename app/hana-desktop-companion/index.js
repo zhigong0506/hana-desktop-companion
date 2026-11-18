@@ -7,7 +7,16 @@ import {
   resolveConfig,
   evaluateRealAction,
   hasTargetBinding,
+  allowedRiskTiers,
 } from "./lib/gates.js";
+import { screenShortcut } from "./lib/shortcuts.js";
+import { normalizeWaitFor, WAIT_FOR_FIELDS, WAIT_CONDITIONS } from "./lib/waitfor.js";
+import {
+  normalizeClipboardRead,
+  clipboardReceipt,
+  redactForLog,
+  CLIPBOARD_READ_MAX_CHARS,
+} from "./lib/clipboard.js";
 
 // Hana Desktop Companion — v2 App.
 //
@@ -17,8 +26,14 @@ import {
 //   - PrintWindow capture of a SPECIFIC window, even when occluded, bound to
 //     HWND+PID, delivered as a session image;
 //   - read-only UIA tree/find and per-monitor hit-testing for diagnosis;
-//   - guarded advanced input (drag / wheel) and window management (move /
-//     resize / minimize / maximize / restore / graceful close).
+//   - guarded advanced input (drag / wheel / keyboard chords) and window
+//     management (move / resize / minimize / maximize / restore / graceful
+//     close);
+//   - multi-monitor inventory, bounded wait-for observation, and a gated
+//     clipboard read (sensitive and truncated; the reply text goes to the
+//     caller, but never into a log line or an error detail). Clipboard write is
+//     deliberately absent: a plaintext payload would have to cross the helper's
+//     command line, where any local process could read it.
 //
 // Safety posture (defence in depth, host review is always the outer layer):
 //   - Observation tools are declared readOnly. Capture is NOT, because its
@@ -46,8 +61,25 @@ const targetSelectProps = {
   foreground: { type: "boolean", description: "定位当前前台窗口（仅当你已知其身份时使用）。" },
 };
 
+// Verbs that require an explicit HWND+PID binding expose only those two
+// selectors: a title/foreground match is not an identity for real input.
+const boundTargetProps = {
+  hwnd: { type: "string", description: "十进制窗口句柄，来自 desktop_windows_list。必填。" },
+  expectedPid: { type: "integer", description: "该窗口的 PID。必填；句柄复用或 PID 变化会被拒绝。" },
+};
+
 export default defineApp(async (sdk) => {
   await sdk.logger.info("hana-desktop-companion loaded");
+
+  // Version is reported by desktop_capabilities; it is informational only, so a
+  // read failure must never block tool registration.
+  let appVersion = "unknown";
+  try {
+    const manifest = JSON.parse(await fs.readFile(new URL("./manifest.json", import.meta.url), "utf8"));
+    appVersion = manifest.version ?? "unknown";
+  } catch {
+    /* keep "unknown" */
+  }
 
   // 1) windows_list — read-only
   await sdk.tools.register({
@@ -231,19 +263,176 @@ export default defineApp(async (sdk) => {
     },
     execute: (args) => runMutation(sdk, "mouse-wheel", args, ["x", "y", "notches", "axis", "hwnd", "expectedPid"]),
   });
+
+  // 9) displays — read-only
+  await sdk.tools.register({
+    name: "desktop_displays_list",
+    description:
+      "列出显示器与虚拟桌面几何：每屏 bounds / workArea（物理像素）、是否主屏、有效 DPI 与缩放百分比，以及虚拟桌面总边界。纯观察，不注入、不改窗口。用于多屏定位、判断坐标落在哪一屏。",
+    parameters: { type: "object", properties: {} },
+    sessionPermission: { readOnly: true },
+    execute: async () => json(await runHelper("list-displays")),
+  });
+
+  // 10) wait-for — read-only bounded observation
+  await sdk.tools.register({
+    name: "desktop_wait_for",
+    description:
+      "有界等待一个观察条件成立：窗口消失/可见/最小化/成为前台、标题包含关键词、UIA 元素出现或消失、某坐标命中目标窗口。最长 30000ms（默认 5000ms），到点返回 timedOut=true。它只返回观察结果：不执行动作、不自动继续任何计划，也不改变焦点或窗口状态。每次轮询都重新核验绑定窗口的 HWND+PID：句柄被其他进程复用时直接以 blockedBy=handle-reused 中止（不会静默超时）；element-gone 只在整个 UIA 遍历完整且未命中时才算成立，UIA 读不到窗口或节点预算耗尽时一律视为状态未知。",
+    parameters: {
+      type: "object",
+      properties: {
+        condition: { type: "string", enum: WAIT_CONDITIONS, description: "等待的条件。" },
+        ...targetSelectProps,
+        query: { type: "string", description: "title-contains / element-exists / element-gone 必需的关键词。" },
+        role: { type: "string", description: "可选 UIA 角色过滤，如 Button、Edit。" },
+        x: { type: "integer", description: "point-hits-target 的物理像素 X。" },
+        y: { type: "integer", description: "point-hits-target 的物理像素 Y。" },
+        timeoutMs: { type: "integer", minimum: 200, maximum: 30000, description: "最长等待毫秒，默认 5000，上限 30000。" },
+        intervalMs: { type: "integer", minimum: 100, maximum: 2000, description: "轮询间隔毫秒，默认 250。" },
+      },
+      required: ["condition"],
+    },
+    sessionPermission: { readOnly: true },
+    execute: async (args = {}) => {
+      const plan = normalizeWaitFor(args);
+      if (!plan.ok) return json({ ok: false, blockedBy: plan.reason, note: "参数未通过校验，未启动等待。" });
+      return json(await runHelper("wait-for", pick(args, WAIT_FOR_FIELDS)));
+    },
+  });
+
+  // 11) send-keys — mutating (sensitive), default preview
+  await sdk.tools.register({
+    name: "desktop_send_keys",
+    description:
+      `向已绑定且当前处于前台的窗口发送一个受限快捷键（chord，如 ctrl+shift+s）。每次调用仅允许一个 chord，避免一条宿主审阅触发多步输入。默认 execute=false 只返回计划；真实执行需 allowRealInput 开启 + actionPolicy 允许 sensitive + hwnd+expectedPid 绑定 + 确认短语 + 宿主逐次审阅。含 Win 修饰键或系统级组合（Win+L、Alt+F4、Ctrl+Shift+Esc、Ctrl+Alt+Delete 等）一律拒绝。不做自由文本输入（那属于原生 computer）。`,
+    parameters: {
+      type: "object",
+      properties: {
+        chord: { type: "string", description: "唯一允许的按键动作，如 ctrl+shift+s；修饰键仅限 ctrl/alt/shift，末位为键名。" },
+        holdMs: { type: "integer", minimum: 0, maximum: 500, description: "按下保持毫秒，默认 40。" },
+        ...boundTargetProps,
+        execute: { type: "boolean", description: "默认 false=仅预演。" },
+        confirmation: { type: "string", description: `实际注入须回填：${CONFIRM_PHRASE}（知悉回执，不替代宿主审阅）。` },
+      },
+      required: ["chord", "hwnd", "expectedPid"],
+    },
+    execute: (args) =>
+      runMutation(sdk, "send-keys", args, ["chord", "holdMs", "hwnd", "expectedPid"], {
+        screen: () => screenShortcut(args),
+      }),
+  });
+
+  // 12) clipboard-read — sensitive, default preview, truncated
+  await sdk.tools.register({
+    name: "desktop_clipboard_read",
+    description:
+      `读取当前剪贴板纯文本（按 sensitive 处理：默认 execute=false 只返回计划；真实读取需 allowRealInput + actionPolicy 允许 sensitive + 绑定 hwnd+expectedPid + 确认短语 + 宿主审阅）。返回内容严格截断（默认 2000，上限 ${CLIPBOARD_READ_MAX_CHARS} 字符），并给出原始长度与是否截断。注意：读取到的文本会作为本次工具结果返回给调用方，因而会进入宿主/模型上下文；本 App 只保证它不被写进日志或错误详情，不宣称它不会出现在宿主的会话记录里。剪贴板是进程全局的，绑定窗口只是审计锚点。`,
+    parameters: {
+      type: "object",
+      properties: {
+        ...boundTargetProps,
+        maxChars: { type: "integer", minimum: 1, maximum: CLIPBOARD_READ_MAX_CHARS, description: "最多返回字符数，默认 2000。" },
+        execute: { type: "boolean", description: "默认 false=不读取。" },
+        confirmation: { type: "string", description: `实际读取须回填：${CONFIRM_PHRASE}。` },
+      },
+      required: ["hwnd", "expectedPid"],
+    },
+    execute: async (args = {}) => {
+      const bounded = normalizeClipboardRead(args);
+      return runMutation(sdk, "clipboard-read", { ...args, maxChars: bounded.maxChars }, ["hwnd", "expectedPid", "maxChars"], {
+        // The text is the deliverable, so it stays in the reply; everything else
+        // (including any future field) is redacted and a size receipt is added.
+        shape: (result) => {
+          if (!result || result.ok !== true || typeof result.text !== "string") return redactForLog(result);
+          const { text: clipboardText, ...rest } = result;
+          return { ...rest, receipt: clipboardReceipt(result), text: clipboardText };
+        },
+      });
+    },
+  });
+
+  // 13) capabilities — read-only status receipt
+  await sdk.tools.register({
+    name: "desktop_capabilities",
+    description:
+      "返回能力与控制状态回执：App/helper 版本、固定动词清单与只读/受控分组、当前 allowRealInput 与 actionPolicy 实际允许的风险档，以及明确未实现的能力（OCR、应用启动、进程/注册表/文件系统、任意 shell、批量动作计划、全屏截图）。纯观察。",
+    parameters: { type: "object", properties: {} },
+    sessionPermission: { readOnly: true },
+    execute: async () => {
+      const config = await resolveConfig(sdk);
+      const tiers = allowedRiskTiers(config.actionPolicy);
+      let helper = null;
+      try {
+        helper = await runHelper("capabilities");
+      } catch (err) {
+        helper = { ok: false, error: err?.message || String(err) };
+      }
+      return json({
+        ok: true,
+        app: { name, version: appVersion, platform: process.platform, arch: process.arch },
+        gates: {
+          allowRealInput: config.allowRealInput,
+          actionPolicy: config.actionPolicy,
+          riskTiersAllowed: tiers,
+          sensitiveActionsEnabled: config.allowRealInput && tiers.includes("sensitive"),
+          destructiveActionsEnabled: config.allowRealInput && tiers.includes("destructive"),
+        },
+        helper: redactForLog(helper),
+        appTools: [
+          "desktop_windows_list",
+          "desktop_window_capture",
+          "desktop_uia_tree",
+          "desktop_uia_find",
+          "desktop_hit_probe",
+          "desktop_window_manage",
+          "desktop_mouse_drag",
+          "desktop_mouse_wheel",
+          "desktop_displays_list",
+          "desktop_wait_for",
+          "desktop_send_keys",
+          "desktop_clipboard_read",
+          "desktop_capabilities",
+        ],
+        notImplemented: [
+          "ocr (capture returns a session image; hand it to the host or an external OCR step — no OCR engine is bundled and no arbitrary image path is accepted)",
+          "app launch",
+          "process / registry / filesystem inventory",
+          "arbitrary shell or executable",
+          "batch action plans",
+          "full-screen capture",
+          "clipboard write (a plaintext payload would have to cross the helper's command line, which any local process can read; not implemented rather than claimed safe)",
+        ],
+      });
+    },
+  });
 });
 
-// Shared flow for the three mutating verbs.
+// Shared flow for the mutating verbs.
 async function runMutation(sdk, verb, args, fields, gateCtx = {}) {
   const wantsExecute = args.execute === true;
   const config = await resolveConfig(sdk);
   const binding = hasTargetBinding(args);
 
+  // Fixed key/chord screening runs before any helper call, preview included: a
+  // denied chord is never worth resolving a target for.
+  const screen = typeof gateCtx.screen === "function" ? gateCtx.screen() : null;
+  if (screen && !screen.allowed) {
+    return json({
+      requestedExecute: wantsExecute,
+      executed: false,
+      blockedBy: `screened:${screen.reason}`,
+      note: "被固定键位筛查表拒绝，未调用 helper、未注入。",
+    });
+  }
+
+  const shape = typeof gateCtx.shape === "function" ? gateCtx.shape : (result) => result;
+
   // Preview path (execute not requested): zero side effects, still runs the guard.
   if (!wantsExecute) {
     const opts = pick(args, fields);
     const result = await runHelper(verb, opts);
-    return json({ requestedExecute: false, forwarded: result });
+    return json({ requestedExecute: false, screen, forwarded: shape(result) });
   }
 
   // Execute requested — every App gate must pass before forwarding execute=true.
@@ -260,13 +449,14 @@ async function runMutation(sdk, verb, args, fields, gateCtx = {}) {
       executed: false,
       blockedBy: verdict.reason,
       risk: verdict.risk,
+      screen,
       note: "已停在 App 门之前，未注入。需要真实执行请先在应用设置开启 allowRealInput 并绑定 hwnd+expectedPid。",
     });
   }
   const opts = pick(args, fields);
   opts.execute = true;
   const result = await runHelper(verb, opts);
-  return json({ requestedExecute: true, risk: verdict.risk, gate: verdict.reason, forwarded: result });
+  return json({ requestedExecute: true, risk: verdict.risk, gate: verdict.reason, screen, forwarded: shape(result) });
 }
 
 function pick(args, fields) {

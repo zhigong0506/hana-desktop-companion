@@ -29,13 +29,35 @@ namespace HanaDesktopCompanion;
 // SECURITY CONTRACT enforced here:
 //   - Fixed verb whitelist; nothing is passed to a shell, and no path is ever
 //     taken from the caller as an executable.
-//   - Every input/window verb binds to a decimal HWND and, when supplied, an
-//     expected PID; a mismatch aborts before any injection.
+//   - Every input/window verb binds to a decimal HWND and a PID resolved at call
+//     time; a mismatch aborts before any injection. wait-for re-verifies that
+//     binding on every poll and aborts (rather than timing out) when the handle
+//     has been reused by another process.
 //   - Blind coordinate actions re-run WindowFromPoint (root owner) immediately
 //     before injection and refuse if the pixel no longer resolves to the
 //     intended target window.
 //   - Process is set per-monitor DPI aware (V2) at startup so every coordinate
 //     read and written is in PHYSICAL pixels, matching UIA and SetCursorPos.
+//
+// 0.2.0 additions, all inside the same closed surface:
+//   - list-displays: pure observation (virtual desktop + per-monitor bounds,
+//     work area, effective DPI). No injection, no window touched.
+//   - wait-for: bounded polling over UIA / window / hit-test conditions. It
+//     returns an observation and stops; it never performs an action and never
+//     continues a plan on its own.
+//   - send-keys: fixed key table + chord denylist. The bound HWND must be the
+//     foreground window, re-verified immediately before SendInput. Any chord
+//     carrying the Win modifier is refused outright.
+//   - clipboard-read: gated and truncated. The bound window is an audit anchor,
+//     not a delivery target: the Windows clipboard is process-global. The reply
+//     text is the deliverable and does go to the caller; it is never written to
+//     a log line or an error detail. Clipboard *write* is deliberately not
+//     implemented — a plaintext payload would have to cross this helper's
+//     command line, where any process on the machine can read it.
+//   - capabilities: a receipt naming the verb surface and what is deliberately
+//     not implemented.
+//   - ParseFlags no longer mistakes a negative number ("-3") for a flag, and an
+//     unknown flag is rejected instead of being silently dropped.
 internal static class Program
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -51,17 +73,23 @@ internal static class Program
         {
             Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); // PER_MONITOR_AWARE_V2
             var verb = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+            var flags = ParseFlags(verb, args);
             object result = verb switch
             {
-                "list-windows" => ListWindows(ParseFlags(args)),
-                "capture-window" => CaptureWindow(ParseFlags(args)),
-                "uia-tree" => UiaTree(ParseFlags(args)),
-                "uia-find" => UiaFind(ParseFlags(args)),
-                "hit-test" => HitTest(ParseFlags(args)),
-                "verify-target" => VerifyTarget(ParseFlags(args)),
-                "manage-window" => ManageWindow(ParseFlags(args)),
-                "mouse-drag" => MouseDrag(ParseFlags(args)),
-                "mouse-wheel" => MouseWheel(ParseFlags(args)),
+                "list-windows" => ListWindows(flags),
+                "capture-window" => CaptureWindow(flags),
+                "uia-tree" => UiaTree(flags),
+                "uia-find" => UiaFind(flags),
+                "hit-test" => HitTest(flags),
+                "verify-target" => VerifyTarget(flags),
+                "manage-window" => ManageWindow(flags),
+                "mouse-drag" => MouseDrag(flags),
+                "mouse-wheel" => MouseWheel(flags),
+                "list-displays" => ListDisplays(),
+                "wait-for" => WaitFor(flags),
+                "send-keys" => SendKeys(flags),
+                "clipboard-read" => ClipboardRead(flags),
+                "capabilities" => Capabilities(),
                 _ => throw new ArgumentException($"Unsupported verb: {verb}")
             };
             Console.OutputEncoding = new UTF8Encoding(false);
@@ -76,14 +104,73 @@ internal static class Program
         }
     }
 
-    private static Dictionary<string, string?> ParseFlags(string[] args)
+    private const string HelperVersion = "0.2.0";
+
+    // Per-verb closed flag surface, mirroring the JS bridge allowlist. An
+    // unlisted flag is rejected here too, so a bridge bug cannot widen the
+    // helper's surface on its own.
+    private static readonly Dictionary<string, string[]> AllowedFlags = new(StringComparer.OrdinalIgnoreCase)
     {
+        ["list-windows"] = new[] { "query", "limit", "includeMinimized", "includeHidden" },
+        ["capture-window"] = new[] { "hwnd", "title", "foreground", "expectedPid", "output", "maxDimension", "disableAutoCrop", "allowVisibleFallback", "wakeIfNeeded" },
+        ["uia-tree"] = new[] { "hwnd", "title", "foreground", "expectedPid", "maxElements", "includeOffscreen" },
+        ["uia-find"] = new[] { "hwnd", "title", "foreground", "expectedPid", "query", "role", "maxElements" },
+        ["hit-test"] = new[] { "x", "y" },
+        ["verify-target"] = new[] { "hwnd", "title", "foreground", "expectedPid", "x", "y" },
+        ["manage-window"] = new[] { "action", "hwnd", "title", "foreground", "expectedPid", "x", "y", "width", "height", "execute" },
+        ["mouse-drag"] = new[] { "fromX", "fromY", "toX", "toY", "button", "steps", "hwnd", "expectedPid", "execute" },
+        ["mouse-wheel"] = new[] { "x", "y", "notches", "axis", "hwnd", "expectedPid", "execute" },
+        ["list-displays"] = Array.Empty<string>(),
+        ["wait-for"] = new[] { "condition", "hwnd", "title", "foreground", "expectedPid", "query", "role", "x", "y", "timeoutMs", "intervalMs" },
+        ["send-keys"] = new[] { "chord", "holdMs", "hwnd", "expectedPid", "execute" },
+        ["clipboard-read"] = new[] { "hwnd", "expectedPid", "maxChars", "execute" },
+        ["capabilities"] = Array.Empty<string>(),
+    };
+
+    // A token starts a new flag only when it is a dash followed by a letter
+    // ("--x", "-x"). A negative number ("-3") is therefore a VALUE. The old
+    // rule ("any leading dash") silently swallowed "--notches -3" and turned
+    // "-3" into a stray flag, so the caller's negative value never arrived.
+    private static bool IsFlagToken(string token)
+    {
+        if (token.Length < 2 || token[0] != '-') return false;
+        var index = token[1] == '-' ? 2 : 1;
+        return index < token.Length && char.IsLetter(token[index]);
+    }
+
+    private static Dictionary<string, string?> ParseFlags(string verb, string[] args)
+    {
+        if (!AllowedFlags.TryGetValue(verb, out var allowed))
+            throw new ArgumentException($"Unsupported verb: {verb}");
+
         var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         for (var i = 1; i < args.Length; i++)
         {
-            var key = args[i].TrimStart('-');
-            if (i + 1 < args.Length && !args[i + 1].StartsWith('-')) result[key] = args[++i];
-            else result[key] = "true";
+            var token = args[i];
+            if (!IsFlagToken(token))
+                throw new ArgumentException($"Unexpected positional argument: {token}");
+
+            var body = token.TrimStart('-');
+            string key;
+            string? value = null;
+            var separator = body.IndexOf('=');
+            if (separator >= 0)
+            {
+                // --text=value keeps a value that itself begins with a dash
+                // unambiguous (used for free-form clipboard text).
+                key = body.Substring(0, separator);
+                value = body.Substring(separator + 1);
+            }
+            else
+            {
+                key = body;
+                if (i + 1 < args.Length && !IsFlagToken(args[i + 1])) value = args[++i];
+            }
+
+            if (!allowed.Contains(key, StringComparer.OrdinalIgnoreCase))
+                throw new ArgumentException($"Unsupported flag for '{verb}': --{key}");
+
+            result[key.ToLowerInvariant()] = value ?? "true";
         }
         return result;
     }
@@ -316,6 +403,334 @@ internal static class Program
         return result;
     }
 
+    // ---------------- list-displays (READ-ONLY) ----------------
+
+    private static object ListDisplays()
+    {
+        var monitors = new List<object>();
+        var primaryIndex = -1;
+        var index = 0;
+        Native.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr hMonitor, IntPtr hdc, ref Native.Rect rect, IntPtr data) =>
+        {
+            var info = new Native.MonitorInfo { Size = Marshal.SizeOf<Native.MonitorInfo>() };
+            if (!Native.GetMonitorInfo(hMonitor, ref info)) return true;
+            uint dpiX = 96, dpiY = 96;
+            try { Native.GetDpiForMonitor(hMonitor, Native.MdtEffectiveDpi, out dpiX, out dpiY); } catch { /* pre-8.1 or unavailable */ }
+            var primary = (info.Flags & Native.MonitorinfofPrimary) != 0;
+            if (primary) primaryIndex = index;
+            monitors.Add(new
+            {
+                index = index++,
+                primary,
+                bounds = new
+                {
+                    left = info.Monitor.Left,
+                    top = info.Monitor.Top,
+                    right = info.Monitor.Right,
+                    bottom = info.Monitor.Bottom,
+                    width = Math.Max(0, info.Monitor.Right - info.Monitor.Left),
+                    height = Math.Max(0, info.Monitor.Bottom - info.Monitor.Top)
+                },
+                workArea = new
+                {
+                    left = info.Work.Left,
+                    top = info.Work.Top,
+                    right = info.Work.Right,
+                    bottom = info.Work.Bottom,
+                    width = Math.Max(0, info.Work.Right - info.Work.Left),
+                    height = Math.Max(0, info.Work.Bottom - info.Work.Top)
+                },
+                dpi = new { x = (int)dpiX, y = (int)dpiY },
+                scalePercent = (int)Math.Round(dpiX * 100.0 / 96.0)
+            });
+            return true;
+        }, IntPtr.Zero);
+
+        return new
+        {
+            ok = true,
+            coordinateSpace = "physical-pixels",
+            dpiAwareness = "per-monitor-v2",
+            virtualScreen = new
+            {
+                left = Native.GetSystemMetrics(Native.SmXVirtualScreen),
+                top = Native.GetSystemMetrics(Native.SmYVirtualScreen),
+                width = Native.GetSystemMetrics(Native.SmCxVirtualScreen),
+                height = Native.GetSystemMetrics(Native.SmCyVirtualScreen)
+            },
+            monitorCount = monitors.Count,
+            primaryIndex,
+            monitors,
+            note = "Observation only. Bounds are physical pixels in the virtual-desktop space; a window can straddle monitors."
+        };
+    }
+
+    // ---------------- wait-for (READ-ONLY, bounded polling) ----------------
+
+    private static readonly HashSet<string> WaitConditions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "window-gone", "window-visible", "window-minimized", "window-foreground",
+        "title-contains", "element-exists", "element-gone", "point-hits-target"
+    };
+
+    private static object WaitFor(Dictionary<string, string?> o)
+    {
+        var condition = Require(o, "condition").ToLowerInvariant();
+        if (!WaitConditions.Contains(condition))
+            throw new ArgumentException($"Unsupported wait condition: {condition}. Allowed: {string.Join(", ", WaitConditions)}");
+
+        // Bounded on purpose: a wait is an observation, so it must never become
+        // an unbounded blocking call the caller cannot reason about.
+        var timeoutMs = Math.Clamp(Int(o, "timeoutMs", 5000), 200, 30000);
+        var intervalMs = Math.Clamp(Int(o, "intervalMs", 250), 100, 2000);
+
+        var query = o.TryGetValue("query", out var q) ? q : null;
+        var role = o.TryGetValue("role", out var r) ? r : null;
+        if ((condition == "title-contains" || condition == "element-exists" || condition == "element-gone")
+            && string.IsNullOrWhiteSpace(query))
+            throw new ArgumentException($"{condition} requires --query.");
+
+        var px = Int(o, "x", int.MinValue);
+        var py = Int(o, "y", int.MinValue);
+        if (condition == "point-hits-target" && (px == int.MinValue || py == int.MinValue))
+            throw new ArgumentException("point-hits-target requires --x and --y (physical pixels).");
+
+        IntPtr hwnd;
+        int? boundPid;
+        if (condition == "window-gone")
+        {
+            // An already-dead handle is the normal case here, so this branch must
+            // not go through the throwing ResolveTarget path. A caller-supplied
+            // expectedPid is what lets us tell "the original window is gone"
+            // apart from "the handle was reused by another process".
+            if (!long.TryParse(Require(o, "hwnd"), out var raw))
+                throw new ArgumentException("window-gone requires a decimal --hwnd.");
+            hwnd = new IntPtr(raw);
+            boundPid = o.TryGetValue("expectedPid", out var gonePid) && int.TryParse(gonePid, out var parsedGonePid)
+                ? parsedGonePid
+                : null;
+        }
+        else
+        {
+            var target = ResolveTarget(o);
+            hwnd = new IntPtr(long.Parse(target.Hwnd));
+            // Always bind the PID resolved here, even when the caller omitted
+            // expectedPid: every poll re-verifies HWND+PID, so a reused handle
+            // fails closed instead of silently observing another process.
+            boundPid = target.Pid;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var polls = 0;
+        object? last = null;
+        while (true)
+        {
+            polls++;
+            var (satisfied, observation, failure) = PollWait(condition, hwnd, boundPid, query, role, px, py);
+            // A handle that now belongs to a different process aborts the wait:
+            // reporting a timeout would look like "nothing happened" while the
+            // observation target had already changed underneath us.
+            if (failure is not null) return failure;
+            last = observation;
+            if (satisfied)
+                return new
+                {
+                    ok = true,
+                    condition,
+                    satisfied = true,
+                    timedOut = false,
+                    polls,
+                    elapsedMs = stopwatch.ElapsedMilliseconds,
+                    timeoutMs,
+                    intervalMs,
+                    observation
+                };
+            if (stopwatch.ElapsedMilliseconds >= timeoutMs)
+                return new
+                {
+                    ok = true,
+                    condition,
+                    satisfied = false,
+                    timedOut = true,
+                    polls,
+                    elapsedMs = stopwatch.ElapsedMilliseconds,
+                    timeoutMs,
+                    intervalMs,
+                    observation = last,
+                    note = "Observation only: the condition did not hold within the timeout. No action was taken and no plan is continued."
+                };
+            var remaining = timeoutMs - (int)stopwatch.ElapsedMilliseconds;
+            Thread.Sleep(Math.Max(1, Math.Min(intervalMs, remaining)));
+        }
+    }
+
+    private static (bool Satisfied, object? Observation, object? Failure) PollWait(
+        string condition, IntPtr hwnd, int? boundPid, string? query, string? role, int px, int py)
+    {
+        var hwndText = hwnd.ToInt64().ToString();
+
+        if (condition == "window-gone")
+        {
+            if (!Native.IsWindow(hwnd))
+                return (true, new { hwnd = hwndText, windowExists = false, originalTargetGone = true }, null);
+
+            Native.GetWindowThreadProcessId(hwnd, out var livePid);
+            var foundPid = (int)livePid;
+            if (boundPid is not null && foundPid != boundPid.Value)
+                return (true, new
+                {
+                    hwnd = hwndText,
+                    windowExists = true,
+                    originalTargetGone = true,
+                    handleReused = true,
+                    expectedPid = boundPid.Value,
+                    foundPid,
+                    note = "The original target is gone; this handle now belongs to a different process."
+                }, null);
+
+            return (false, new
+            {
+                hwnd = hwndText,
+                windowExists = true,
+                originalTargetGone = false,
+                foundPid,
+                ambiguous = boundPid is null,
+                note = boundPid is null
+                    ? "The handle is still alive and no expectedPid was supplied, so the original target cannot be reported as gone."
+                    : "The bound window is still alive."
+            }, null);
+        }
+
+        // Every other condition observes a specific window, so a vanished handle is
+        // simply "not satisfied yet" and a reused handle aborts.
+        if (!Native.IsWindow(hwnd))
+            return (false, new { hwnd = hwndText, windowExists = false }, null);
+
+        Native.GetWindowThreadProcessId(hwnd, out var currentPid);
+        var pid = (int)currentPid;
+        if (boundPid is not null && pid != boundPid.Value)
+            return (false, null, new
+            {
+                ok = false,
+                condition,
+                blockedBy = "handle-reused",
+                expectedPid = boundPid.Value,
+                foundPid = pid,
+                note = "The bound handle now belongs to a different process. The wait is aborted rather than observing the wrong window."
+            });
+
+        switch (condition)
+        {
+            case "window-visible":
+            case "window-minimized":
+            case "window-foreground":
+                {
+                    var window = DescribeWindow(hwnd);
+                    var pidMatched = boundPid is null || window.Pid == boundPid.Value;
+                    var satisfied = condition switch
+                    {
+                        "window-visible" => window.Visible && !window.Minimized,
+                        "window-minimized" => window.Minimized,
+                        _ => window.Foreground && pidMatched
+                    };
+                    return (satisfied, new { window, pidMatched }, null);
+                }
+            case "title-contains":
+                {
+                    var window = DescribeWindow(hwnd);
+                    var matched = window.Title.Contains(query!, StringComparison.OrdinalIgnoreCase);
+                    return (matched, new { hwnd = window.Hwnd, title = window.Title, pid = window.Pid, titleMatched = matched }, null);
+                }
+            case "element-exists":
+            case "element-gone":
+                {
+                    var root = TryGetRoot(hwnd.ToInt64());
+                    if (root is null)
+                        // UI Automation could not read the window at all. That is
+                        // "unknown", never "the element is gone".
+                        return (false, new
+                        {
+                            hwnd = hwndText,
+                            uiaRootAvailable = false,
+                            uiaComplete = false,
+                            note = "UI Automation could not read this window, so the element state is unknown."
+                        }, null);
+
+                    var outcome = FindFirstMatch(root, query!, role);
+                    var observation = new
+                    {
+                        hwnd = hwndText,
+                        uiaRootAvailable = true,
+                        uiaComplete = outcome.Complete,
+                        matched = outcome.Match
+                    };
+                    if (condition == "element-exists") return (outcome.Found, observation, null);
+                    // element-gone is only satisfied by a *complete* walk that
+                    // found nothing. An exhausted node budget means the tree was
+                    // not fully searched, so the state is unknown.
+                    return (!outcome.Found && outcome.Complete, observation, null);
+                }
+            default: // point-hits-target
+                {
+                    var point = new Native.Point { X = px, Y = py };
+                    var leaf = Native.WindowFromPoint(point);
+                    var root = leaf != IntPtr.Zero ? Native.GetAncestor(leaf, Native.GaRoot) : IntPtr.Zero;
+                    var hit = root != IntPtr.Zero ? DescribeWindow(root) : null;
+                    var matches = hit is not null
+                        && string.Equals(hit.Hwnd, hwndText, StringComparison.Ordinal)
+                        && (boundPid is null || hit.Pid == boundPid.Value);
+                    return (matches, new { point = new { x = px, y = py }, hitWindow = hit }, null);
+                }
+        }
+    }
+
+    // Iterative UIA search with an early exit and a hard node budget. The result
+    // separates "searched and found nothing" from "could not search completely":
+    // a caller must never turn an unreadable tree or an exhausted budget into
+    // "the element is gone".
+    private sealed record UiaSearchOutcome(bool Found, bool Complete, Dictionary<string, object>? Match);
+
+    private const int UiaNodeBudget = 4000;
+
+    private static UiaSearchOutcome FindFirstMatch(AutomationElement root, string query, string? roleFilter)
+    {
+        var needle = query.ToLowerInvariant();
+        var pending = new Stack<AutomationElement>();
+        pending.Push(root);
+        var visited = 0;
+        var degraded = false;
+
+        while (pending.Count > 0)
+        {
+            if (visited >= UiaNodeBudget)
+                return new UiaSearchOutcome(false, false, null); // budget exhausted: state unknown
+            visited++;
+
+            var parent = pending.Pop();
+            AutomationElementCollection children;
+            try { children = parent.FindAll(TreeScope.Children, Condition.TrueCondition); }
+            catch { degraded = true; continue; }
+
+            foreach (AutomationElement child in children)
+            {
+                try
+                {
+                    var name = (child.Current.Name ?? "").ToLowerInvariant();
+                    var automationId = (child.Current.AutomationId ?? "").ToLowerInvariant();
+                    var className = SafeClassName(child).ToLowerInvariant();
+                    var role = child.Current.LocalizedControlType ?? "";
+                    var roleOk = string.IsNullOrEmpty(roleFilter) || role.Contains(roleFilter, StringComparison.OrdinalIgnoreCase);
+                    if (roleOk && (name.Contains(needle) || automationId.Contains(needle) || className.Contains(needle)))
+                        return new UiaSearchOutcome(true, true, DescribeElement(child, 0, "el-match"));
+                }
+                catch { degraded = true; /* one unreadable node makes the walk incomplete */ }
+                pending.Push(child);
+            }
+        }
+
+        return new UiaSearchOutcome(false, !degraded, null);
+    }
+
     // ---------------- manage-window ----------------
 
     private static object ManageWindow(Dictionary<string, string?> o)
@@ -465,6 +880,326 @@ internal static class Program
         "right" => (Native.MouseEventRightDown, Native.MouseEventRightUp),
         "middle" => (Native.MouseEventMiddleDown, Native.MouseEventMiddleUp),
         _ => (Native.MouseEventLeftDown, Native.MouseEventLeftUp)
+    };
+
+    // ---------------- send-keys (REAL INPUT, target-bound, chord-screened) ----------------
+
+    private static readonly Dictionary<string, ushort> KeyTable = BuildKeyTable();
+
+    // Canonical (order-insensitive) chords that are never sent. The Win-modifier
+    // rule below already refuses every Win chord; these entries stay explicit so
+    // the refusal is auditable and mirrored 1:1 by the JS pre-screen.
+    private static readonly HashSet<string> DeniedChords = new(StringComparer.Ordinal)
+    {
+        "alt+f4", "alt+tab", "alt+escape", "alt+space",
+        "ctrl+escape", "ctrl+shift+escape", "ctrl+alt+delete", "ctrl+alt+tab", "ctrl+alt+escape",
+        "win+l", "win+r", "win+x", "win+e", "win+d", "win+u", "win+p", "win+s", "win+v", "win+a", "win+i",
+        "win+tab", "win+space", "win+ctrl+d", "win+ctrl+f4"
+    };
+
+    private static Dictionary<string, ushort> BuildKeyTable()
+    {
+        var table = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["enter"] = 0x0D, ["return"] = 0x0D,
+            ["tab"] = 0x09,
+            ["escape"] = 0x1B, ["esc"] = 0x1B,
+            ["space"] = 0x20,
+            ["backspace"] = 0x08,
+            ["delete"] = 0x2E, ["del"] = 0x2E,
+            ["insert"] = 0x2D, ["ins"] = 0x2D,
+            ["home"] = 0x24, ["end"] = 0x23,
+            ["pageup"] = 0x21, ["pagedown"] = 0x22,
+            ["left"] = 0x25, ["up"] = 0x26, ["right"] = 0x27, ["down"] = 0x28
+        };
+        for (var c = 'a'; c <= 'z'; c++) table[c.ToString()] = (ushort)(0x41 + (c - 'a'));
+        for (var d = '0'; d <= '9'; d++) table[d.ToString()] = (ushort)(0x30 + (d - '0'));
+        for (var f = 1; f <= 12; f++) table[$"f{f}"] = (ushort)(0x70 + f - 1);
+        return table;
+    }
+
+    private static string CanonicalKeyName(string key) => key.ToLowerInvariant() switch
+    {
+        "return" => "enter",
+        "esc" => "escape",
+        "del" => "delete",
+        "ins" => "insert",
+        _ => key.ToLowerInvariant()
+    };
+
+    private static (bool Ok, ushort[] Modifiers, ushort Key, string? Canonical, string? Reason) ParseChord(string chord)
+    {
+        var raw = chord.Trim().ToLowerInvariant();
+        if (raw.Length == 0) return (false, Array.Empty<ushort>(), 0, null, "Empty key chord.");
+
+        var parts = raw.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0) return (false, Array.Empty<ushort>(), 0, null, "Empty key chord.");
+
+        var modifiers = new List<ushort>();
+        for (var i = 0; i < parts.Length - 1; i++)
+        {
+            switch (parts[i])
+            {
+                case "ctrl":
+                case "control":
+                    if (modifiers.Contains(0x11)) return (false, Array.Empty<ushort>(), 0, null, "Duplicate modifier: ctrl");
+                    modifiers.Add(0x11);
+                    break;
+                case "alt":
+                    if (modifiers.Contains(0x12)) return (false, Array.Empty<ushort>(), 0, null, "Duplicate modifier: alt");
+                    modifiers.Add(0x12);
+                    break;
+                case "shift":
+                    if (modifiers.Contains(0x10)) return (false, Array.Empty<ushort>(), 0, null, "Duplicate modifier: shift");
+                    modifiers.Add(0x10);
+                    break;
+                case "win":
+                case "meta":
+                case "cmd":
+                    return (false, Array.Empty<ushort>(), 0, null, "The 'win' modifier is refused: no Windows-key chord can be sent through this App.");
+                default:
+                    return (false, Array.Empty<ushort>(), 0, null, $"Unsupported modifier: {parts[i]}");
+            }
+        }
+
+        var keyName = parts[^1];
+        if (!KeyTable.TryGetValue(keyName, out var virtualKey))
+            return (false, Array.Empty<ushort>(), 0, null, $"Unsupported key: {keyName}");
+
+        var canonicalParts = new List<string>();
+        if (modifiers.Contains(0x11)) canonicalParts.Add("ctrl");
+        if (modifiers.Contains(0x12)) canonicalParts.Add("alt");
+        if (modifiers.Contains(0x10)) canonicalParts.Add("shift");
+        canonicalParts.Add(CanonicalKeyName(keyName));
+        var canonical = string.Join("+", canonicalParts);
+
+        if (DeniedChords.Contains(canonical))
+            return (false, Array.Empty<ushort>(), 0, null, $"Chord is on the system-level denylist and is never sent: {canonical}");
+
+        return (true, modifiers.ToArray(), virtualKey, canonical, null);
+    }
+
+    private static object SendKeys(Dictionary<string, string?> o)
+    {
+        var chordText = Require(o, "chord");
+        var parsedChord = ParseChord(chordText);
+        if (!parsedChord.Ok) throw new ArgumentException(parsedChord.Reason!);
+        var plan = (parsedChord.Modifiers, parsedChord.Key, parsedChord.Canonical!);
+
+        var holdMs = Math.Clamp(Int(o, "holdMs", 40), 0, 500);
+        var preview = !Flag(o, "execute");
+
+        // A keystroke goes to whatever holds the foreground, so the target must be
+        // bound and must actually be that window. Title/foreground matching alone
+        // is not enough for real input.
+        if (!o.ContainsKey("hwnd") || !o.ContainsKey("expectedPid"))
+            throw new ArgumentException("send-keys requires --hwnd and --expectedPid: a keystroke is delivered to the foreground window, so the target must be bound.");
+
+        var target = ResolveTarget(o);
+        var hwnd = new IntPtr(long.Parse(target.Hwnd));
+        var foregroundNow = Native.GetForegroundWindow();
+        var foregroundOk = foregroundNow == hwnd;
+        var chord = plan.Item3;
+
+        if (preview)
+            return new
+            {
+                ok = true,
+                dryRun = true,
+                action = "send-keys",
+                chord,
+                target = new { target.Hwnd, target.Pid, target.Title },
+                targetIsForeground = foregroundOk,
+                holdMs,
+                note = "No key was injected."
+            };
+
+        if (IsSecureDesktopActive())
+            return new
+            {
+                ok = false,
+                blockedBy = "secure-desktop",
+                chord,
+                note = "Keystrokes are refused while a secure desktop (lock screen / UAC prompt) is in front."
+            };
+        if (!foregroundOk)
+            return new
+            {
+                ok = false,
+                blockedBy = "target-not-foreground",
+                chord,
+                target = new { target.Hwnd, target.Title },
+                foregroundWindow = foregroundNow != IntPtr.Zero ? DescribeWindow(foregroundNow) : null,
+                note = "The bound window is not the foreground window; refusing to inject keys into an unknown target."
+            };
+
+        Native.GetWindowThreadProcessId(hwnd, out var livePid);
+        if ((int)livePid != target.Pid)
+            return new { ok = false, blockedBy = "pid-changed", expectedPid = target.Pid, foundPid = (int)livePid };
+
+        // Re-check foreground and PID immediately before injection to narrow the
+        // focus-stealing race between target resolution and SendInput.
+        foregroundNow = Native.GetForegroundWindow();
+        if (foregroundNow != hwnd)
+            return new { ok = false, blockedBy = "target-not-foreground", chord };
+        Native.GetWindowThreadProcessId(hwnd, out livePid);
+        if ((int)livePid != target.Pid)
+            return new { ok = false, blockedBy = "pid-changed", expectedPid = target.Pid, foundPid = (int)livePid };
+
+        InjectChord(plan.Modifiers, plan.Key, holdMs);
+        return new
+        {
+            ok = true,
+            action = "send-keys",
+            chord,
+            target = new { target.Hwnd, target.Pid, target.Title },
+            holdMs
+        };
+    }
+
+    private static void InjectChord(ushort[] modifiers, ushort key, int holdMs)
+    {
+        var size = Marshal.SizeOf<Native.Input>();
+        if (size != 40)
+            throw new InvalidOperationException($"Unexpected INPUT size {size}; refusing to inject keyboard input.");
+
+        var downs = new List<Native.Input>();
+        foreach (var modifier in modifiers) downs.Add(Native.KeyInput(modifier, false));
+        downs.Add(Native.KeyInput(key, false));
+        var ups = new List<Native.Input> { Native.KeyInput(key, true) };
+        for (var i = modifiers.Length - 1; i >= 0; i--) ups.Add(Native.KeyInput(modifiers[i], true));
+
+        var downSent = false;
+        try
+        {
+            var sent = Native.SendInput((uint)downs.Count, downs.ToArray(), size);
+            downSent = sent > 0;
+            if (sent != downs.Count)
+                throw new InvalidOperationException($"SendInput accepted {sent} of {downs.Count} key-down events.");
+            Thread.Sleep(Math.Max(10, holdMs));
+        }
+        finally
+        {
+            // Always try to release every key that could have been pressed, even
+            // when SendInput partially succeeds or an exception interrupts hold.
+            if (downSent)
+            {
+                var released = Native.SendInput((uint)ups.Count, ups.ToArray(), size);
+                if (released != ups.Count)
+                    throw new InvalidOperationException($"SendInput accepted {released} of {ups.Count} key-up events.");
+            }
+        }
+        Thread.Sleep(15);
+    }
+
+    // ---------------- clipboard (GATED, TRUNCATED, NEVER ECHOED) ----------------
+
+    private const int ClipboardReadDefaultChars = 2000;
+    private const int ClipboardReadMaxChars = 4000;
+
+    private static object ClipboardRead(Dictionary<string, string?> o)
+    {
+        // The bound window is an audit anchor ("which context is this text for"),
+        // not an enforcement boundary: the Windows clipboard is process-global.
+        var target = ResolveTarget(o);
+        var maxChars = Math.Clamp(Int(o, "maxChars", ClipboardReadDefaultChars), 1, ClipboardReadMaxChars);
+        if (!Flag(o, "execute"))
+            return new
+            {
+                ok = true,
+                dryRun = true,
+                action = "clipboard-read",
+                maxChars,
+                target = new { target.Hwnd, target.Pid, target.Title },
+                note = "The clipboard was not read. Pass execute=true after the App gate and host review."
+            };
+
+        if (IsSecureDesktopActive())
+            return new { ok = false, blockedBy = "secure-desktop", action = "clipboard-read" };
+
+        string? content = null;
+        for (var attempt = 0; attempt < 3 && content is null; attempt++)
+        {
+            try
+            {
+                content = System.Windows.Forms.Clipboard.ContainsText()
+                    ? System.Windows.Forms.Clipboard.GetText()
+                    : string.Empty;
+            }
+            catch
+            {
+                Thread.Sleep(60); // clipboard held by another process; retry briefly
+            }
+        }
+        if (content is null)
+            return new { ok = false, error = "clipboard-unavailable", note = "The clipboard is held by another process. Nothing was read." };
+
+        var truncated = content.Length > maxChars;
+        var slice = truncated ? content.Substring(0, maxChars) : content;
+        return new
+        {
+            ok = true,
+            action = "clipboard-read",
+            target = new { target.Hwnd, target.Pid, target.Title },
+            chars = content.Length,
+            returnedChars = slice.Length,
+            truncated,
+            text = slice
+        };
+    }
+
+    private static bool IsSecureDesktopActive()
+    {
+        // Opening the input desktop is not proof of anything by itself: it only
+        // says we could open *a* desktop. Compare its identity with the desktop
+        // this thread is attached to, and refuse whenever either identity cannot
+        // be resolved (fail closed rather than guess).
+        var input = Native.OpenInputDesktop(0, false, Native.DesktopReadObjects);
+        if (input == IntPtr.Zero) return true;
+
+        try
+        {
+            var thread = Native.GetThreadDesktop(Native.GetCurrentThreadId());
+            if (thread == IntPtr.Zero) return true;
+
+            try
+            {
+                var inputName = Native.GetUserObjectName(input);
+                var threadName = Native.GetUserObjectName(thread);
+                if (string.IsNullOrEmpty(inputName) || string.IsNullOrEmpty(threadName)) return true; // cannot verify
+                return !string.Equals(inputName, threadName, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                Native.CloseDesktop(thread);
+            }
+        }
+        finally
+        {
+            Native.CloseDesktop(input);
+        }
+    }
+
+    // ---------------- capabilities (READ-ONLY receipt) ----------------
+
+    private static object Capabilities() => new
+    {
+        ok = true,
+        helper = "hana-desktop-companion-helper",
+        version = HelperVersion,
+        framework = RuntimeInformation.FrameworkDescription,
+        os = RuntimeInformation.OSDescription,
+        arch = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant(),
+        dpiAwareness = "per-monitor-v2",
+        coordinateSpace = "physical-pixels",
+        verbs = AllowedFlags.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray(),
+        readOnlyVerbs = new[] { "capabilities", "hit-test", "list-displays", "list-windows", "uia-find", "uia-tree", "verify-target", "wait-for" },
+        gatedVerbs = new[] { "capture-window", "clipboard-read", "manage-window", "mouse-drag", "mouse-wheel", "send-keys" },
+        unsupported = new[]
+        {
+            "ocr", "app-launch", "process-list", "registry", "filesystem",
+            "shell", "batch-plan", "full-screen-capture", "clipboard-write"
+        }
     };
 
     private static object DescribeManagePlan(string action, Dictionary<string, string?> o) => action switch
@@ -791,11 +1526,84 @@ internal static class Native
     public const uint MouseEventWheel = 0x0800;
     public const uint MouseEventHwHEEL = 0x1000;
 
+    public const int SmXVirtualScreen = 76;
+    public const int SmYVirtualScreen = 77;
+    public const int SmCxVirtualScreen = 78;
+    public const int SmCyVirtualScreen = 79;
+    public const int MdtEffectiveDpi = 0;
+    public const int MonitorinfofPrimary = 0x00000001;
+    public const uint DesktopReadObjects = 0x0001;
+    public const int UoiName = 2;
+    public const uint InputKeyboard = 1;
+    public const uint KeyeventfKeyup = 0x0002;
+
     private const int DwmaExtendedFrameBounds = 9;
     private const int DwmaCloaked = 14;
 
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MonitorInfo
+    {
+        public int Size;
+        public Rect Monitor;
+        public Rect Work;
+        public int Flags;
+    }
+
+    // INPUT must marshal to exactly 40 bytes on x64, which requires the union to
+    // be sized by MOUSEINPUT (32 bytes). Declaring only KEYBDINPUT yields a
+    // short struct and SendInput then fails with ERROR_INVALID_PARAMETER.
+    [StructLayout(LayoutKind.Sequential)] public struct MouseInput
+    {
+        public int Dx;
+        public int Dy;
+        public uint MouseData;
+        public uint Flags;
+        public uint Time;
+        public IntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)] public struct KeybdInput
+    {
+        public ushort VirtualKey;
+        public ushort ScanCode;
+        public uint Flags;
+        public uint Time;
+        public IntPtr ExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)] public struct HardwareInput
+    {
+        public uint Msg;
+        public ushort ParamL;
+        public ushort ParamH;
+    }
+
+    [StructLayout(LayoutKind.Explicit)] public struct InputUnion
+    {
+        [FieldOffset(0)] public MouseInput Mouse;
+        [FieldOffset(0)] public KeybdInput Keyboard;
+        [FieldOffset(0)] public HardwareInput Hardware;
+    }
+
+    [StructLayout(LayoutKind.Sequential)] public struct Input
+    {
+        public uint Type;
+        public InputUnion Data;
+    }
+
+    public static Input KeyInput(ushort virtualKey, bool up) => new()
+    {
+        Type = InputKeyboard,
+        Data = new InputUnion
+        {
+            Keyboard = new KeybdInput
+            {
+                VirtualKey = virtualKey,
+                Flags = up ? KeyeventfKeyup : 0
+            }
+        }
+    };
     [StructLayout(LayoutKind.Sequential)] public struct WindowPlacement
     {
         public int Length;
@@ -828,6 +1636,28 @@ internal static class Native
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
+    public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref Rect rect, IntPtr data);
+    [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfo info);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr GetThreadDesktop(uint threadId);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder? pvInfo, int nLength, out int lpnLengthNeeded);
+
+    // The desktop's own name ("Default", "Winlogon", ...). Returns null when the
+    // handle cannot be queried, which callers must treat as "cannot verify".
+    public static string? GetUserObjectName(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero) return null;
+        if (GetUserObjectInformation(handle, UoiName, null, 0, out var needed) || needed <= 0) return null;
+        var buffer = new StringBuilder(needed / 2 + 1);
+        return GetUserObjectInformation(handle, UoiName, buffer, buffer.Capacity * 2, out _) ? buffer.ToString() : null;
+    }
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint count, Input[] inputs, int size);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out Rect value, int size);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
 

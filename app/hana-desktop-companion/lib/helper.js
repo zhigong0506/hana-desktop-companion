@@ -28,10 +28,19 @@ const VERB_FLAGS = {
   "manage-window": ["action", "hwnd", "title", "foreground", "expectedPid", "x", "y", "width", "height", "execute"],
   "mouse-drag": ["fromX", "fromY", "toX", "toY", "button", "steps", "hwnd", "expectedPid", "execute"],
   "mouse-wheel": ["x", "y", "notches", "axis", "hwnd", "expectedPid", "execute"],
+  "list-displays": [],
+  "wait-for": ["condition", "hwnd", "title", "foreground", "expectedPid", "query", "role", "x", "y", "timeoutMs", "intervalMs"],
+  "send-keys": ["chord", "holdMs", "hwnd", "expectedPid", "execute"],
+  "clipboard-read": ["hwnd", "expectedPid", "maxChars", "execute"],
+  "capabilities": [],
 };
 
 // Flags whose values must be a finite integer before they reach Win32.
-const INT_FLAGS = new Set(["limit", "maxElements", "maxDimension", "expectedPid", "x", "y", "fromX", "fromY", "toX", "toY", "width", "height", "notches", "steps"]);
+const INT_FLAGS = new Set([
+  "limit", "maxElements", "maxDimension", "expectedPid", "x", "y",
+  "fromX", "fromY", "toX", "toY", "width", "height", "notches", "steps",
+  "timeoutMs", "intervalMs", "holdMs", "maxChars",
+]);
 
 function toArgv(verb, opts) {
   const allowed = VERB_FLAGS[verb];
@@ -58,7 +67,30 @@ function toArgv(verb, opts) {
   return argv;
 }
 
-export async function runHelper(verb, opts, { timeoutMs = 20000 } = {}) {
+// Exposed for the logic tests: the argv contract is what keeps the helper's
+// surface closed, so it is verified without spawning anything.
+export function buildHelperArgv(verb, opts = {}) {
+  return toArgv(verb, opts);
+}
+
+// The verb -> flag map itself, for the test that pins it against the native
+// helper's own allowlist.
+export function helperVerbSurface() {
+  return Object.fromEntries(Object.entries(VERB_FLAGS).map(([verb, flags]) => [verb, [...flags]]));
+}
+
+// A wait verb may legitimately hold the helper for its own timeout, so the
+// child-process kill budget is derived from that timeout instead of the default.
+const VERB_TIMEOUT_MS = { "wait-for": 40000 };
+
+function timeoutFor(verb, opts) {
+  const base = VERB_TIMEOUT_MS[verb] ?? 20000;
+  if (verb !== "wait-for") return base;
+  const requested = Number(opts?.timeoutMs);
+  return Number.isFinite(requested) ? Math.min(base, Math.round(requested) + 5000) : base;
+}
+
+export async function runHelper(verb, opts, { timeoutMs } = {}) {
   if (process.platform !== "win32") throw new Error("hana-desktop-companion supports Windows only.");
   if (process.arch !== "x64") throw new Error(`hana-desktop-companion requires Windows x64; current arch is ${process.arch}.`);
 
@@ -67,7 +99,7 @@ export async function runHelper(verb, opts, { timeoutMs = 20000 } = {}) {
     const { stdout, stderr } = await execFileAsync(HELPER_PATH, argv, {
       windowsHide: true,
       encoding: "utf8",
-      timeout: timeoutMs,
+      timeout: timeoutMs ?? timeoutFor(verb, opts),
       maxBuffer: 16 * 1024 * 1024,
     });
     const lines = String(stdout || "").split(/\r?\n/).filter(Boolean);
